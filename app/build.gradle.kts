@@ -71,11 +71,17 @@ android {
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
         // release = 仅由 GitHub Actions 云端构建并发版；本地不产出 release 包。
+        // CI fork 兜底：keystore 缺失时回落 debug 签名，保证 fork 也能出可安装包。
         release {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            if (hasReleaseKeystore) signingConfig = signingConfigs.getByName("release")
+            if (hasReleaseKeystore) {
+                signingConfig = signingConfigs.getByName("release")
+            } else {
+                // 无 keystore（fork CI）：用 debug 密钥签名，产物可安装可升级覆盖安装
+                signingConfig = signingConfigs.getByName("debug")
+            }
         }
     }
 
