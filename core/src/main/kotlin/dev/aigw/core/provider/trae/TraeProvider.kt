@@ -364,6 +364,8 @@ class TraeProvider(
             JsonObject().apply {
                 addProperty("machineId", machineId)
                 addProperty("deviceId", deviceId)
+                // region 是登录开始时的权威区域，回调判定必须以它为准
+                addProperty("region", target.id)
                 addProperty("at", nowMillis())
             }.toString(),
         )
@@ -378,11 +380,11 @@ class TraeProvider(
         val callback = TraeLogin.parseCallback(callbackUrl)
         val traceId = queryParam(callbackUrl, "loginTraceID")
         val machine = resolveMachine(traceId)
-        // 回调里的 loginHost / 回调域名能区分发行版；拿不到就按国内版处理
-        val region = TraeRegion.infer(
-            queryParam(callbackUrl, "loginHost"),
-            callback.enterpriseId.ifEmpty { queryParam(callbackUrl, "host") },
-        )
+        // 区域判定分两级：
+        //  1. 优先取 beginWebLogin 落盘的 region —— 登录页按哪个发行版打开的，账号就属于哪个发行版，
+        //     回调参数可能缺失或被 EnterpriseID 干扰，不可靠；
+        //  2. 落盘记录缺失（如老版本升级后残留回调）时，再从回调参数兜底推断。
+        val region = resolveRegion(traceId) ?: inferRegionFromCallback(callbackUrl, callback)
         var account = TraeAccount(
             uid = callback.uid,
             accessToken = callback.accessToken,
@@ -414,6 +416,32 @@ class TraeProvider(
         val machineId = obj.get("machineId")?.asString.orEmpty()
         val deviceId = obj.get("deviceId")?.asString.orEmpty()
         return if (machineId.isEmpty() || deviceId.isEmpty()) null else machineId to deviceId
+    }
+
+    /** 读取 beginWebLogin 落盘的权威 region；字段缺失（旧版本残留）返回 null。 */
+    private fun resolveRegion(traceId: String?): TraeRegion? {
+        if (traceId.isNullOrEmpty()) return null
+        val raw = store.read(pendingKey(traceId)) ?: return null
+        val obj = runCatching { JsonParser.parseString(raw).asJsonObject }.getOrNull() ?: return null
+        val region = obj.get("region")?.asString ?: return null
+        return TraeRegion.of(region)
+    }
+
+    /**
+     * 回调参数兜底推断发行版（仅落盘 region 缺失时使用）。
+     *
+     * 注意：不使用 enterpriseId / TenantID —— 那是纯数字租户编号，与登录域名无关，
+     * 传入 [TraeRegion.infer] 会把国际版账号永远误判成国内版。
+     * 只有明确含 trae.ai / trae.cn 的 loginHost 才是有效信号。
+     */
+    private fun inferRegionFromCallback(callbackUrl: String, callback: CallbackAccount): TraeRegion {
+        val loginHost = queryParam(callbackUrl, "loginHost").orEmpty().lowercase()
+        val hostParam = queryParam(callbackUrl, "host").orEmpty().lowercase()
+        return when {
+            loginHost.contains("trae.ai") || hostParam.contains("trae.ai") -> TraeRegion.INTL
+            loginHost.contains("trae.cn") || hostParam.contains("trae.cn") -> TraeRegion.CN
+            else -> TraeRegion.CN
+        }
     }
 
     // ------------------------------------------------------------------ 工具
