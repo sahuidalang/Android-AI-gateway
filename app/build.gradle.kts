@@ -19,7 +19,13 @@ val keystoreProps = Properties().apply {
     if (file.exists()) file.inputStream().use { load(it) }
 }
 
-val hasReleaseKeystore = rootProject.file("keystore.properties").exists()
+// 有效签名 = keystore.properties 存在、storeFile 指向的 keystore 文件真实存在且非空（>0 字节）。
+// fork CI 场景下 secrets 为空会生成空 keystore，此时回落 debug 签名而不是抛错。
+val hasReleaseKeystore = rootProject.file("keystore.properties").exists() &&
+    runCatching {
+        val storePath = keystoreProps.getProperty("storeFile")
+        !storePath.isNullOrBlank() && rootProject.file(storePath).let { it.exists() && it.length() > 0L }
+    }.getOrDefault(false)
 
 fun keystoreValue(key: String): String =
     keystoreProps.getProperty(key)
