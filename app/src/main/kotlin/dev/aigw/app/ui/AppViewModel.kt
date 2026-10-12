@@ -26,6 +26,7 @@ import dev.aigw.core.gateway.CustomProviderConfig
 import dev.aigw.core.gateway.GatewayEngine
 import dev.aigw.core.gateway.GatewaySettings
 import dev.aigw.core.gateway.LoginOutcome
+import dev.aigw.core.gateway.ModelExposureSettings
 import dev.aigw.core.gateway.ModelsCatalog
 import dev.aigw.core.gateway.ProviderInfo
 import dev.aigw.core.gateway.ProviderModelsChunk
@@ -66,9 +67,6 @@ private const val SMS_RESEND_INTERVAL_MS = 60_000L
 
 /** 金色渐变落盘去抖：取色拖动每帧都调 setGoldColors，攒一小段再写加密存储。 */
 private const val GOLD_PERSIST_DEBOUNCE_MS = 300L
-
-/** 模型目录保鲜期：进入模型页时若目录未过期就不再重拉。 */
-private const val MODELS_STALE_MS = 10 * 60 * 1000L
 
 /** 项目仓库地址（GitHub）。 */
 private const val PROJECT_URL = "https://github.com/xibai6668/Android-AI-gateway"
@@ -245,6 +243,8 @@ data class AppUiState(
     val storage: StorageReport? = null,
     /** 安全防护与风控设置。 */
     val security: dev.aigw.core.security.SecuritySettings = dev.aigw.core.security.SecuritySettings(),
+    /** 模型开放名单：只对外暴露勾选的模型。 */
+    val modelExposure: dev.aigw.core.gateway.ModelExposureSettings = dev.aigw.core.gateway.ModelExposureSettings(),
     /** 出网取证记录列表。 */
     val evidences: List<dev.aigw.core.security.OutboundEvidence> = emptyList(),
     /** 当前生效的脱敏规则词汇数。 */
@@ -284,6 +284,7 @@ private class Snapshot(
     val security: dev.aigw.core.security.SecuritySettings,
     val evidences: List<dev.aigw.core.security.OutboundEvidence>,
     val sanitizerRulesCount: Int,
+    val modelExposure: dev.aigw.core.gateway.ModelExposureSettings,
 )
 
 class AppViewModel(
@@ -329,7 +330,7 @@ class AppViewModel(
     @Volatile
     private var modelsGeneration = 0
 
-    /** 上次发起模型目录刷新的时刻，用于切页时判断目录是否已过期。 */
+    /** 上次发起模型目录刷新的时刻；为 0 表示本次进程内还没拉过。 */
     @Volatile
     private var modelsFetchedAt = 0L
 
@@ -350,8 +351,6 @@ class AppViewModel(
         // 调用记录与统计改在引擎后台预载（冷启动不阻塞主线程），就绪后补一次刷新
         engine.setStartupDataReadyListener { refresh() }
         refresh()
-        // 启动时在后台静默预拉取一次模型，进入模型页直接秒开（不弹「正在拉取」提示）
-        refreshModels(silent = true)
         // 自动检查更新：默认开启，每天最多一次，失败静默
         maybeAutoCheckUpdate()
     }
@@ -389,6 +388,7 @@ class AppViewModel(
                     security = engine.securitySettings(),
                     evidences = engine.sanitizer.evidenceList(),
                     sanitizerRulesCount = engine.sanitizer.currentRulesCount(),
+                    modelExposure = engine.modelExposureSettings(),
                 )
             }
             _state.value = _state.value.copy(
@@ -411,6 +411,7 @@ class AppViewModel(
                 security = snapshot.security,
                 evidences = snapshot.evidences,
                 sanitizerRulesCount = snapshot.sanitizerRulesCount,
+                modelExposure = snapshot.modelExposure,
             )
         }
     }
@@ -495,15 +496,12 @@ class AppViewModel(
     }
 
     /**
-     * 进入模型页时按需刷新：已有目录且未过期就不再打一轮上游。
+     * 进入模型页时首次拉取：本次进程内还没拉过才拉，之后进入不再自动重拉。
      *
-     * 每次切到模型 tab 都全量重拉会让点按后立刻进入 loading 并触发多轮 state 更新，
-     * 目录本身变化很慢，短时间内重复拉取只是白打上游。
+     * 模型目录只在「首次进入模型页」与「手动刷新」时更新，避免每次切页都打上游。
      */
-    fun refreshModelsIfStale() {
-        val fresh = _state.value.models.isNotEmpty() &&
-            System.currentTimeMillis() - modelsFetchedAt < MODELS_STALE_MS
-        if (!fresh) refreshModels()
+    fun ensureModelsLoaded() {
+        if (modelsFetchedAt == 0L) refreshModels()
     }
 
     /** 流式增量：把一个供应商就绪的目录合并进 state（已在主线程串行执行，替换该供应商旧条目）。 */
@@ -538,6 +536,34 @@ class AppViewModel(
             }
             _state.value = _state.value.copy(modelTestLatencies = updated)
         }
+    }
+
+    // ------------------------------------------------------------------ 模型开放名单
+
+    fun modelExposure(): ModelExposureSettings = engine.modelExposureSettings()
+
+    fun updateModelExposure(updated: ModelExposureSettings) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { engine.updateModelExposure(updated) }
+            _state.value = _state.value.copy(modelExposure = updated)
+        }
+    }
+
+    /** 单个模型勾选/取消勾选。 */
+    fun toggleModelExposed(fullId: String, checked: Boolean) {
+        val current = engine.modelExposureSettings()
+        val exposed = current.exposed.toMutableSet()
+        if (checked) exposed.add(fullId) else exposed.remove(fullId)
+        updateModelExposure(current.copy(exposed = exposed))
+    }
+
+    /** 按分组（routePrefix）批量勾选/取消勾选当前已加载的模型。 */
+    fun toggleGroupExposed(routePrefix: String, checked: Boolean) {
+        val current = engine.modelExposureSettings()
+        val exposed = current.exposed.toMutableSet()
+        val groupIds = _state.value.models.filter { it.routePrefix == routePrefix }.map { it.fullId }
+        if (checked) exposed.addAll(groupIds) else exposed.removeAll(groupIds.toSet())
+        updateModelExposure(current.copy(exposed = exposed))
     }
 
     fun consumeNotice() {

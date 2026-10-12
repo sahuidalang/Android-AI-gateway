@@ -230,6 +230,10 @@ class GatewayEngine(
     @Volatile
     private var proxy: ProxySettings = ProxySettings.fromJson(store.read(ProxySettings.STORE_KEY))
 
+    /** 模型开放名单：独立于 [settings] 存储与保存入口，勾选模型不触发 provider 重载。 */
+    @Volatile
+    private var modelExposure: ModelExposureSettings = ModelExposureSettings.load(store)
+
     /** 当前正在监听的登录回调服务（同一时间只允许一个登录流程）。 */
     private var callbackServer: LoopbackCallbackServer? = null
 
@@ -313,6 +317,27 @@ class GatewayEngine(
 
     fun metricsOf(providerId: String): dev.aigw.core.failover.ProviderMetricsTracker =
         providerMetrics.computeIfAbsent(providerId) { dev.aigw.core.failover.ProviderMetricsTracker() }
+
+    // ------------------------------------------------------------------ 模型开放名单
+
+    fun modelExposureSettings(): ModelExposureSettings = modelExposure
+
+    /** 更新开放名单并落盘；独立入口，不调用 reconfigureProviders。 */
+    fun updateModelExposure(updated: ModelExposureSettings) {
+        modelExposure = updated
+        store.write(ModelExposureSettings.STORE_KEY, updated.toJson().toString())
+        log("模型开放名单已更新（过滤=${if (updated.filterEnabled) "开启" else "关闭"}，已勾选=${updated.exposed.size}）")
+    }
+
+    /** [filterEnabled] 为 false 时原样返回，否则只保留在开放名单中的模型。 */
+    private fun filterExposed(models: List<RoutedModel>): List<RoutedModel> =
+        if (!modelExposure.filterEnabled) models else models.filter { modelExposure.allows(it.fullId) }
+
+    /**
+     * 对外暴露的模型目录：模型页 UI 用 `modelsStreaming`（不过滤，展示全量，供勾选）；
+     * HTTP `/v1/models` 用本方法（按开放名单过滤）。
+     */
+    fun exposedModels(): List<RoutedModel> = filterExposed(models())
 
     // ------------------------------------------------------------------ 代理
 
@@ -881,8 +906,8 @@ class GatewayEngine(
                     models.add(RoutedModel(provider.id, provider.displayName, model))
                 }
             }
-            // 供应商自报错误只在拿不到任何模型时才算失败；带内置快照的回退
-            // （如 CodeBuddy 无账号时显示 FALLBACK_MODELS）不是故障，报红反而吓人
+            // 供应商自报错误只在拿不到任何模型时才算失败；没有内置快照兜底后，
+            // 无账号/拉取失败是否报红由各家 listModels 的 error 决定
             ProviderModelsChunk(provider.id, models, if (models.isEmpty()) view.error.ifEmpty { null } else null)
         } catch (e: Exception) {
             logWarn("拉取模型目录失败（${provider.id}）：${e.message}")
