@@ -24,24 +24,34 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -63,6 +73,17 @@ fun ModelsScreen(state: AppUiState, viewModel: AppViewModel) {
     // 按 routePrefix 分组：区域型供应商（如 WorkBuddy 国内与国外）各成一个分组
     val grouped = remember(state.models) { state.models.groupBy { it.routePrefix } }
     val exposure = state.modelExposure
+    // 折叠状态：记「被折叠」的分组（默认全展开）。
+    //
+    // 用不可变 Set + rememberSaveable，而不是 SnapshotStateList：
+    // 后者在保存时机（onPause / 进程回收）被 SaveableStateRegistry 读取时，
+    // 若正好与 LazyColumn 的组合读快照交叠，会抛「Reading a state that was created
+    // after the snapshot was taken」——折叠的分组越多越容易撞上，表现为点折叠直接闪退。
+    // 换成纯值 Set 后 save/restore 不碰快照，问题消失；读取仍在组合作用域，
+    // 折叠变化会正常触发列表重建。
+    var collapsed by rememberSaveable { mutableStateOf(emptySet<String>()) }
+    // 测试失败原文可能很长，行内只展示截断提示，全文点开弹窗查看
+    var failureDetail by remember { mutableStateOf<String?>(null) }
 
     // 刷新按钮旋转动效：仅在加载中才创建无限过渡，停止后不空转每帧插值
     val spinAngle = if (state.modelsLoading) {
@@ -115,7 +136,7 @@ fun ModelsScreen(state: AppUiState, viewModel: AppViewModel) {
                     contentDescription = "刷新",
                     tint = MaterialTheme.colorScheme.primary,
                     modifier = Modifier
-                        .bouncyClick { viewModel.refreshModels() }
+                        .bouncyClick { viewModel.refreshModels(forceRefresh = true) }
                         .padding(6.dp)
                         .graphicsLayer { rotationZ = iconRotation },
                 )
@@ -177,17 +198,46 @@ fun ModelsScreen(state: AppUiState, viewModel: AppViewModel) {
                 for ((routePrefix, models) in grouped) {
                     val title = models.firstOrNull()?.providerName ?: routePrefix
                     val allExposed = models.isNotEmpty() && models.all { exposure.allows(it.fullId) }
+                    // 这一组本轮没拉到上游、用的是上次成功的清单：明确标注，不能让旧清单冒充实时结果
+                    val cachedGroup = models.isNotEmpty() && models.all { it.cached }
                     item(key = "header-$routePrefix") {
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clip(MaterialTheme.shapes.large)
                                 .background(MaterialTheme.colorScheme.surface)
+                                .clickable {
+                                    collapsed = if (routePrefix in collapsed) {
+                                        collapsed - routePrefix
+                                    } else {
+                                        collapsed + routePrefix
+                                    }
+                                }
                                 .padding(start = 14.dp, end = 14.dp, top = 12.dp, bottom = 12.dp),
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
+                            Icon(
+                                imageVector = if (routePrefix in collapsed) Icons.Filled.ExpandMore else Icons.Filled.ExpandLess,
+                                contentDescription = if (routePrefix in collapsed) "展开" else "折叠",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(18.dp),
+                            )
                             SectionLabel(title)
+                            if (cachedGroup) {
+                                Box(
+                                    modifier = Modifier
+                                        .clip(CircleShape)
+                                        .background(MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.6f))
+                                        .padding(horizontal = 8.dp, vertical = 2.dp),
+                                ) {
+                                    Text(
+                                        text = "缓存",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onErrorContainer,
+                                    )
+                                }
+                            }
                             Box(Modifier.weight(1f))
                             if (exposure.filterEnabled) {
                                 Text(
@@ -216,6 +266,8 @@ fun ModelsScreen(state: AppUiState, viewModel: AppViewModel) {
                             }
                         }
                     }
+                    // 折叠的分组跳过其模型行：只渲染分组头，模型行即时收起
+                    if (routePrefix in collapsed) continue
                     items(models, key = { it.fullId }) { model ->
                         val testStatus = state.modelTestLatencies[model.fullId]
                         ModelRow(
@@ -229,6 +281,7 @@ fun ModelsScreen(state: AppUiState, viewModel: AppViewModel) {
                                 Toast.makeText(context, "已复制模型名称：${model.fullId}", Toast.LENGTH_SHORT).show()
                             },
                             onTest = { viewModel.testModel(model) },
+                            onShowFailure = { failureDetail = it },
                         )
                     }
                 }
@@ -241,6 +294,24 @@ fun ModelsScreen(state: AppUiState, viewModel: AppViewModel) {
                     }
                 }
             }
+        }
+
+        failureDetail?.let { reason ->
+            AlertDialog(
+                onDismissRequest = { failureDetail = null },
+                title = { Text("测试失败原因") },
+                text = {
+                    Text(
+                        text = reason,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState()),
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = { failureDetail = null }) { Text("关闭") }
+                },
+            )
         }
     }
 }
@@ -298,6 +369,7 @@ private fun ModelRow(
     onToggleExposed: (Boolean) -> Unit,
     onCopy: () -> Unit,
     onTest: () -> Unit,
+    onShowFailure: (String) -> Unit,
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -374,7 +446,11 @@ private fun ModelRow(
                     color = MaterialTheme.colorScheme.error,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.widthIn(max = 200.dp),
+                    modifier = Modifier
+                        .widthIn(max = 200.dp)
+                        .clip(MaterialTheme.shapes.small)
+                        .clickable { onShowFailure(testStatus.reason) }
+                        .padding(2.dp),
                 )
             }
             null -> Unit

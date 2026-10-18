@@ -22,6 +22,10 @@ import dev.aigw.app.ui.theme.formatHex
 import dev.aigw.app.ui.theme.parseHexColor
 import dev.aigw.app.service.GatewayService
 import dev.aigw.app.service.GatewayTileService
+import dev.aigw.core.gateway.BatchActionResult
+import dev.aigw.core.gateway.BatchProgress
+import dev.aigw.core.gateway.BatchTarget
+import dev.aigw.core.gateway.CreditRefreshResult
 import dev.aigw.core.gateway.CustomProviderConfig
 import dev.aigw.core.gateway.GatewayEngine
 import dev.aigw.core.gateway.GatewaySettings
@@ -42,13 +46,11 @@ import dev.aigw.core.provider.ProviderCapability
 import dev.aigw.core.provider.QuotaPack
 import dev.aigw.core.provider.custom.CustomProvider
 import dev.aigw.core.provider.RoutedModel
-import dev.aigw.core.provider.codebuddy.CodeBuddyProvider
 import dev.aigw.core.provider.trae.TraeRegion
 import dev.aigw.core.provider.trae.TraeProvider
 import dev.aigw.core.store.KeyValueStore
 import dev.aigw.core.usage.CallRecord
 import dev.aigw.core.usage.LogLine
-import dev.aigw.core.usage.StorageAudit
 import dev.aigw.core.usage.StorageReport
 import dev.aigw.core.usage.UsageStats
 import kotlinx.coroutines.Dispatchers
@@ -190,6 +192,28 @@ sealed interface ModelLoadState {
 }
 
 /**
+ * 批量动作进行中的进度（供 UI 显示「已完成 X/N（当前：某账号）」）。
+ */
+@Immutable
+data class BatchProgressUi(val done: Int, val total: Int, val current: String)
+
+/** 批量结果里的单个失败账号条目。 */
+@Immutable
+data class BatchItem(val account: String, val message: String)
+
+/**
+ * 一次批量动作的结构化结果：UI 据此展示「成功 N 个 / 失败 M 个」+ 逐条原因，
+ * 而不是把整批失败拼成一条读不完的字符串。
+ */
+@Immutable
+data class BatchOutcome(
+    val title: String,
+    val succeeded: Int,
+    val failed: Int,
+    val items: List<BatchItem>,
+)
+
+/**
  * 界面状态的唯一快照。
  *
  * 标 [Immutable]：字段虽含 List/Map，但都是每次整体替换、不再就地修改，
@@ -219,12 +243,14 @@ data class AppUiState(
     /** 模型测速状态，键为 `model.fullId`。 */
     val modelTestLatencies: Map<String, ModelTestStatus> = emptyMap(),
     val calls: List<CallRecord> = emptyList(),
-    /** 存储中的记录条数（含未载入内存的，仅供「数据管理」展示）。 */
+    /** 存储中的记录条数（含未载入内存的）。 */
     val storedCalls: Int = 0,
     /** 已拉取的额度包明细，键为 `providerId/uid`。 */
     val creditPacks: Map<String, List<QuotaPack>> = emptyMap(),
     /** 已拉取的成长任务明细，键为 `providerId/uid`。 */
     val taskLists: Map<String, dev.aigw.core.provider.ProviderTaskListView> = emptyMap(),
+    /** 已拉取的积分流水明细，键为 `providerId/uid`。 */
+    val pointsBills: Map<String, dev.aigw.core.provider.PointsBillListView> = emptyMap(),
     val logs: List<LogLine> = emptyList(),
     val settings: GatewaySettings = GatewaySettings(),
     /** 代理设置。 */
@@ -243,14 +269,22 @@ data class AppUiState(
     val storage: StorageReport? = null,
     /** 安全防护与风控设置。 */
     val security: dev.aigw.core.security.SecuritySettings = dev.aigw.core.security.SecuritySettings(),
+    /** 可选的悬浮窗保活是否开启（需「显示在其他应用上层」权限）。 */
+    val overlayKeepAlive: Boolean = false,
     /** 模型开放名单：只对外暴露勾选的模型。 */
     val modelExposure: dev.aigw.core.gateway.ModelExposureSettings = dev.aigw.core.gateway.ModelExposureSettings(),
+    /** 故障转移与并发配置。 */
+    val failover: dev.aigw.core.failover.ModelFailoverSettings = dev.aigw.core.failover.ModelFailoverSettings(),
     /** 出网取证记录列表。 */
     val evidences: List<dev.aigw.core.security.OutboundEvidence> = emptyList(),
     /** 当前生效的脱敏规则词汇数。 */
     val sanitizerRulesCount: Int = 0,
     val busy: String = "",
     val notice: String = "",
+    /** 批量动作进行中的进度；非空时 UI 显示「已完成 X/N（当前：某账号）」。 */
+    val batchProgress: BatchProgressUi? = null,
+    /** 批量动作结束后要展示的结构化结果；非空时弹结果面板，逐条列出失败原因。 */
+    val batchOutcome: BatchOutcome? = null,
     /** 是否正在检查更新。 */
     val updateChecking: Boolean = false,
     /** 检查到的新版本；非空时界面弹更新窗。 */
@@ -285,6 +319,8 @@ private class Snapshot(
     val evidences: List<dev.aigw.core.security.OutboundEvidence>,
     val sanitizerRulesCount: Int,
     val modelExposure: dev.aigw.core.gateway.ModelExposureSettings,
+    val failover: dev.aigw.core.failover.ModelFailoverSettings,
+    val overlayKeepAlive: Boolean,
 )
 
 class AppViewModel(
@@ -313,12 +349,6 @@ class AppViewModel(
 
     /** 下次可重新发送验证码的时间，按供应商记（界面倒计时会随页面重置，不能只靠界面拦）。 */
     private val smsResendAt = HashMap<String, Long>()
-
-    /** 最近一次设备授权登录的 state，供「重新检查授权状态」手动重试。 */
-    private val deviceStates = HashMap<String, String>()
-
-    /** 最近一次设备授权登录的区域，保证手动重试轮询与登录时打同一个端点。 */
-    private val deviceRegions = HashMap<String, String>()
 
     /** 金色渐变去抖落盘的挂起任务；每次取色取消上一轮，松手后才真正写盘。 */
     private var persistAppearanceJob: Job? = null
@@ -389,6 +419,8 @@ class AppViewModel(
                     evidences = engine.sanitizer.evidenceList(),
                     sanitizerRulesCount = engine.sanitizer.currentRulesCount(),
                     modelExposure = engine.modelExposureSettings(),
+                    failover = engine.failoverSettings(),
+                    overlayKeepAlive = dev.aigw.app.data.KeepAlivePrefs.overlayEnabled(engine.store()),
                 )
             }
             _state.value = _state.value.copy(
@@ -412,6 +444,8 @@ class AppViewModel(
                 evidences = snapshot.evidences,
                 sanitizerRulesCount = snapshot.sanitizerRulesCount,
                 modelExposure = snapshot.modelExposure,
+                failover = snapshot.failover,
+                overlayKeepAlive = snapshot.overlayKeepAlive,
             )
         }
     }
@@ -432,7 +466,8 @@ class AppViewModel(
             // 整体 equals 在主线程上是 O(总字符数) 的开销。
             if (calls.size == current.calls.size && logs.size == current.logs.size &&
                 calls.firstOrNull()?.id == current.calls.firstOrNull()?.id &&
-                logs.firstOrNull()?.atMillis == current.logs.firstOrNull()?.atMillis
+                // 用 seq（单调自增）而不是时间戳：同一毫秒内的多条新日志时间戳相同，会漏刷一轮
+                logs.firstOrNull()?.seq == current.logs.firstOrNull()?.seq
             ) {
                 return@launch
             }
@@ -441,7 +476,7 @@ class AppViewModel(
     }
 
     /**
-     * 单独刷新「数据管理」的存储占用。
+     * 单独刷新存储占用（用量统计页展示用）。
      *
      * 刻意不放在 [refresh] 里：它要扫全部加密存储键并遍历缓存目录，代价高，
      * 而记录页每 5 秒就会调一次 refresh。
@@ -455,7 +490,7 @@ class AppViewModel(
         }
     }
 
-    fun refreshModels(silent: Boolean = false) {
+    fun refreshModels(silent: Boolean = false, forceRefresh: Boolean = false) {
         val gen = ++modelsGeneration
         modelsFetchedAt = System.currentTimeMillis()
         viewModelScope.launch {
@@ -473,7 +508,7 @@ class AppViewModel(
             )
             val (catalog, error) = withContext(Dispatchers.IO) {
                 runCatching {
-                    engine.modelsStreaming { chunk ->
+                    engine.modelsStreaming(forceRefresh = forceRefresh) { chunk ->
                         viewModelScope.launch {
                             if (gen == modelsGeneration) applyModelsChunk(chunk)
                         }
@@ -492,7 +527,30 @@ class AppViewModel(
                 modelsError = listOf(error, providerError).filter { it.isNotEmpty() }.joinToString("；"),
                 busy = if (quiet) _state.value.busy else "",
             )
+            // 清名单要读写加密存储（同步落盘），放到 IO 线程，避免主线程卡帧
+            pruneStaleExposure(catalog.models)
         }
+    }
+
+    /**
+     * 清掉开放名单里远端已不存在的模型。
+     *
+     * 只处理「本轮真的拉到了模型」的前缀：拉不到（无账号、上游临时故障）时目录可能只是暂时取不到，
+     * 不能凭此抹掉用户的勾选。
+     */
+    private suspend fun pruneStaleExposure(live: List<RoutedModel>) {
+        if (live.isEmpty()) return
+        val current = engine.modelExposureSettings()
+        if (current.exposed.isEmpty()) return
+        val liveIds = live.map { it.fullId }.toSet()
+        val prefixes = live.map { it.routePrefix }.toSet()
+        val stale = current.exposed.filter { it.substringBefore('/') in prefixes && it !in liveIds }
+        if (stale.isEmpty()) return
+        // 同步落盘（加密存储 commit），必须在 IO 线程
+        withContext(Dispatchers.IO) {
+            engine.updateModelExposure(current.copy(exposed = current.exposed - stale.toSet()))
+        }
+        _state.value = _state.value.copy(modelExposure = engine.modelExposureSettings())
     }
 
     /**
@@ -633,6 +691,51 @@ class AppViewModel(
         }
     }
 
+    fun updateFailoverSettings(updated: dev.aigw.core.failover.ModelFailoverSettings) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { engine.updateFailoverSettings(updated) }
+            refresh()
+        }
+    }
+
+    /**
+     * 开关「悬浮窗保活」：落盘后立即生效。
+     *
+     * 悬浮窗只在**网关服务运行时**显示（它服务于保活，网关没跑时没有意义）；
+     * 未启动时只记开关，下次启动网关时由前台服务拉起。
+     */
+    fun setOverlayKeepAlive(enabled: Boolean) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { dev.aigw.app.data.KeepAlivePrefs.setOverlayEnabled(engine.store(), enabled) }
+            if (enabled) {
+                if (!engine.isRunning()) {
+                    notice("已开启，悬浮窗将在网关服务启动后显示")
+                } else {
+                    val label = "网关 ${engine.settings().port}"
+                    val shown = dev.aigw.app.service.FloatingKeepAlive.show(app, label)
+                    notice(
+                        if (shown) "悬浮窗保活已开启"
+                        else "已开启，但缺少「显示在其他应用上层」权限，请在上方授权",
+                    )
+                }
+            } else {
+                dev.aigw.app.service.FloatingKeepAlive.hide(app)
+                notice("悬浮窗保活已关闭")
+            }
+            refresh()
+        }
+    }
+
+    /**
+     * 授权返回后重新应用悬浮窗：仅在网关服务运行时补显示（开关开着且未在显示）。
+     */
+    fun reapplyOverlayIfEnabled() {
+        if (!engine.isRunning()) return
+        if (!dev.aigw.app.data.KeepAlivePrefs.overlayEnabled(engine.store())) return
+        if (dev.aigw.app.service.FloatingKeepAlive.isShowing()) return
+        dev.aigw.app.service.FloatingKeepAlive.show(app, "网关 ${engine.settings().port}")
+    }
+
     /** 重新加载反审核脱敏处理链。 */
     fun reloadSanitizerPipeline() = action {
         val count = engine.reloadSanitizerPipeline()
@@ -727,18 +830,16 @@ class AppViewModel(
 
     /**
      * 设备授权的区域感知版本（WorkBuddy）：先把区域同步写进供应商设置，
-     * 引擎开登录页时才能读到正确的端点（cn=copilot.tencent.com / global=workbuddy.ai），
-     * 同时记住本轮登录的区域，保证「重新检查授权状态」轮询同一端点。
+     * 引擎开登录页时才能读到正确的端点（cn=copilot.tencent.com / global=workbuddy.ai）。
      */
     fun beginDeviceLogin(providerId: String, region: String) {
-        deviceRegions[providerId] = region
         val settings = providerSettings(providerId)
         viewModelScope.launch {
             withContext(Dispatchers.IO) {
                 engine.updateProviderSettings(providerId, settings.copy(options = settings.options + ("region" to region)))
             }
         }
-        beginBrowserLogin(providerId)
+        beginBrowserLogin(providerId, region)
     }
 
     fun providerOption(providerId: String, key: String, fallback: String = ""): String =
@@ -756,11 +857,11 @@ class AppViewModel(
      * 浏览器完成登录后由网关接住回调并落池；WorkBuddy 没有本地回调，
      * 返回轮询用的 state，由 [pollDeviceLogin] 换取 token。
      */
-    fun beginBrowserLogin(providerId: String) {
+    fun beginBrowserLogin(providerId: String, region: String = "") {
         viewModelScope.launch {
             _state.value = _state.value.copy(busy = "正在准备登录")
             val result = withContext(Dispatchers.IO) {
-                runCatching { engine.beginBrowserLogin(providerId) }
+                runCatching { engine.beginBrowserLogin(providerId, region) }
             }
             _state.value = _state.value.copy(busy = "")
             result.fold(
@@ -770,8 +871,8 @@ class AppViewModel(
                         return@fold
                     }
                     if (ticket.pollState.isNotEmpty()) {
-                        deviceStates[providerId] = ticket.pollState
-                        pollDeviceLogin(providerId, ticket.pollState)
+                        // 用票据自带的区域轮询：授权页创建在哪个区域，就只能在该区域查这个 state
+                        pollDeviceLogin(providerId, ticket.pollState, ticket.region)
                     } else {
                         _state.value = _state.value.copy(notice = "已在浏览器打开登录页，完成后会自动添加账号")
                     }
@@ -834,17 +935,6 @@ class AppViewModel(
                 onFailure = { onResult(emptyList(), it.message ?: "拉取失败") },
             )
         }
-    }
-
-    /** 手动重新检查设备授权状态（浏览器里已完成登录但轮询错过时）。 */
-    fun checkDeviceAuth(providerId: String, region: String = "") {
-        val state = deviceStates[providerId]
-        if (state.isNullOrEmpty()) {
-            notice("请先点「在浏览器中打开登录页」，完成登录后再回来检查")
-            return
-        }
-        if (region.isNotEmpty()) deviceRegions[providerId] = region
-        pollDeviceLogin(providerId, state, deviceRegions[providerId].orEmpty())
     }
 
     /** 发短信验证码（msgid 内部暂存）；[onResult] 回传错误信息（空串表示成功）。 */
@@ -986,89 +1076,148 @@ class AppViewModel(
         "账号已删除"
     }
 
-    /** 刷新额度；uid 为空表示刷新该供应商的全部账号。 */
-    fun refreshCredits(providerId: String, uid: String?) = action {
+    /**
+     * 刷新额度；uid 为空表示刷新该供应商的全部账号。
+     *
+     * 单账号与「某个供应商全部账号」都可能从供应商详情页这类没有批量结果面板的页面触发，
+     * 所以走提示（notice）而不是结果面板；全局的「刷新全部额度」才走 [runBatch]（首页/任务中心有面板）。
+     */
+    fun refreshCredits(providerId: String, uid: String?) {
         if (uid != null) {
-            val result = engine.refreshCredits(providerId, uid)
-            if (result.error.isNotEmpty()) throw IllegalStateException(result.error)
-            "额度已刷新"
-        } else {
+            action {
+                val result = engine.refreshCredits(providerId, uid)
+                if (result.error.isNotEmpty()) throw IllegalStateException(result.error)
+                "额度已刷新"
+            }
+            return
+        }
+        // 有界并发（默认并发度）替掉串行；结果汇总成一句话，避免整批失败拼成一条读不完的串。
+        action {
             val results = engine.refreshAllCredits(providerId)
             if (results.isEmpty()) throw IllegalStateException("该供应商还没有账号")
-            val failed = results.filter { it.error.isNotEmpty() }
-            if (failed.isNotEmpty()) {
-                throw IllegalStateException(failed.joinToString("；") { "${it.uid}：${it.error}" })
-            }
-            "额度已刷新（${results.size} 个账号）"
+            summarizeCredits(results, "（${results.size} 个账号）")
         }
     }
 
-    /** 刷新全部供应商的额度。 */
-    fun refreshAllCredits() = action {
-        val results = engine.refreshAllCredits()
-        if (results.isEmpty()) throw IllegalStateException("还没有账号，先去「供应商」页添加")
+    /** 刷新全部供应商的额度（首页 / 任务中心入口）：有进度与结构化结果面板。 */
+    fun refreshAllCredits() = runBatch("刷新额度") { onProgress ->
+        if (engine.accounts().isEmpty()) throw IllegalStateException("还没有账号，先去「供应商」页添加")
+        engine.refreshAllCredits(onProgress = onProgress).map { it.toBatchResult() }
+    }
+
+    /** 额度刷新结果 → 批量结果条目（error 为空即成功）。 */
+    private fun CreditRefreshResult.toBatchResult(): BatchActionResult =
+        BatchActionResult(providerId, uid, nickname, error.isEmpty(), error)
+
+    /** 无结果面板的场景：把额度刷新结果压成一句提示（失败最多列 3 个，其余折叠）。 */
+    private fun summarizeCredits(results: List<CreditRefreshResult>, suffix: String): String {
         val failed = results.filter { it.error.isNotEmpty() }
-        if (failed.isNotEmpty()) {
-            throw IllegalStateException(failed.joinToString("；") { "${it.providerId}/${it.uid}：${it.error}" })
-        }
-        "额度已刷新（${results.size} 个账号）"
+        if (failed.isEmpty()) return "额度已刷新$suffix"
+        val head = failed.take(3).joinToString("；") { "${it.nickname.ifEmpty { it.uid }}：${it.error}" }
+        val rest = if (failed.size > 3) "…等 ${failed.size} 个" else ""
+        return "额度刷新完成：成功 ${results.size - failed.size} 个，失败 ${failed.size} 个（$head$rest）"
     }
 
     /**
      * 对所有支持签到的账号批量签到。
      *
-     * 只签到 Trae 与 WorkBuddy 国内版（cn）：WorkBuddy 国际版（global）没有签到制度，
-     * 跳过可避免每次批量签到都报错。
-     *
-     * 逐个执行并把每个账号的上游原话带回，避免用户只看到一句「N 个账号失败」而无法定位。
+     * 只签到 Trae 与 WorkBuddy 国内版（cn）：WorkBuddy 国际版（global）与 Trae 国际版
+     * 没有签到制度，跳过可避免每次批量签到都报错。
+     * 并发与失败隔离由 [GatewayEngine.performActionAll] 负责；这里只负责选目标与汇总结果。
      */
-    fun checkinAll() = action {
+    fun checkinAll() = runBatch("批量签到") { onProgress ->
         val targets = engine.providers()
             .filter { ProviderCapability.CHECKIN in it.capabilities }
             .flatMap { info -> engine.accounts(info.id) }
             // 区域型供应商的国际版没有签到制度（Trae INTL / WorkBuddy global），跳过避免整批报错
             .filter { account -> accountRegion(account.providerId, account.uid) != TraeRegion.INTL.id }
+            .map { BatchTarget(it.providerId, it.uid) }
         if (targets.isEmpty()) throw IllegalStateException("还没有支持签到的账号")
-
-        val results = targets.map { account ->
-            account to engine.performAction(account.providerId, account.uid, ACTION_CHECKIN)
-        }
-        val failed = results.filter { !it.second.ok }
-        if (failed.isNotEmpty()) {
-            throw IllegalStateException(
-                failed.joinToString("；") {
-                    "${it.first.nickname.ifEmpty { it.first.uid }}：${it.second.message}"
-                },
-            )
-        }
-        "签到完成（${results.size} 个账号）"
+        engine.performActionAll(targets, ACTION_CHECKIN, onProgress = onProgress)
     }
 
     /**
      * 对所有支持任务的账号批量执行任务（目前是 Loomy 的新手任务）。
      *
      * Trae / WorkBuddy 的「任务」实际就是每日签到，已由 [checkinAll] 覆盖。
+     * 全部成功时把各账号的上游原话拼进提示（如 Loomy 的领取结果），失败时走结果面板逐条展示。
      */
-    fun runAllTasks() = action {
+    fun runAllTasks() = runBatch(
+        busyText = "批量任务",
+        successNotice = { results ->
+            results.filter { it.message.isNotEmpty() }
+                .joinToString("；") { "${it.nickname.ifEmpty { it.uid }}：${it.message}" }
+                .ifEmpty { "任务完成（${results.size} 个账号）" }
+        },
+    ) { onProgress ->
         val targets = engine.providers()
             .filter { ProviderCapability.TASKS in it.capabilities }
             .flatMap { info -> engine.accounts(info.id) }
+            .map { BatchTarget(it.providerId, it.uid) }
         if (targets.isEmpty()) throw IllegalStateException("还没有支持任务的账号")
+        engine.performActionAll(targets, ACTION_TASKS, onProgress = onProgress)
+    }
 
-        val results = targets.map { account ->
-            account to engine.performAction(account.providerId, account.uid, ACTION_TASKS)
-        }
-        val failed = results.filter { !it.second.ok }
-        if (failed.isNotEmpty()) {
-            throw IllegalStateException(
-                failed.joinToString("；") {
-                    "${it.first.nickname.ifEmpty { it.first.uid }}：${it.second.message}"
+    /**
+     * 跑一批批量动作：后台 IO 执行、过程中把进度写回状态、结束后给结构化结果并刷新界面。
+     *
+     * [block] 在 IO 线程执行，[onProgress] 由引擎在后台线程回调（不保证顺序），
+     * 这里只负责把它翻译成 [BatchProgressUi]；窗口内的 Composable 直接读这个字段画进度。
+     * [successNotice] 只在全部成功时决定提示文案（默认「成功 N 个」）。
+     */
+    private fun runBatch(
+        busyText: String,
+        successNotice: ((List<BatchActionResult>) -> String)? = null,
+        block: (onProgress: (BatchProgress) -> Unit) -> List<BatchActionResult>,
+    ) {
+        viewModelScope.launch {
+            // 先置空上一次的结果面板，避免新一轮的进度被旧面板挡住
+            _state.value = _state.value.copy(batchProgress = BatchProgressUi(0, 0, ""), batchOutcome = null)
+            val outcome = withContext(Dispatchers.IO) {
+                runCatching {
+                    val results = block { progress -> onBatchProgress(progress) }
+                    val failed = results.filter { !it.ok }
+                    BatchOutcome(
+                        title = busyText,
+                        succeeded = results.count { it.ok },
+                        failed = failed.size,
+                        // 只把失败账号进结果面板：成功账号的文案千篇一律，逐条列出反而淹没真正要看的原因
+                        items = failed.map { BatchItem(it.nickname.ifEmpty { it.uid }, it.message) },
+                    ) to results
+                }
+            }
+            _state.value = _state.value.copy(batchProgress = null)
+            outcome.fold(
+                { (result, results) ->
+                    if (result.failed > 0) {
+                        _state.value = _state.value.copy(
+                            batchOutcome = result,
+                            notice = "${busyText}完成：成功 ${result.succeeded} 个，失败 ${result.failed} 个",
+                        )
+                    } else {
+                        val text = successNotice?.invoke(results)
+                            ?: "${busyText}完成：成功 ${result.succeeded} 个"
+                        _state.value = _state.value.copy(notice = text)
+                    }
                 },
+                { error -> _state.value = _state.value.copy(notice = error.message ?: "操作失败") },
             )
+            refresh()
         }
-        results.joinToString("；") {
-            "${it.first.nickname.ifEmpty { it.first.uid }}：${it.second.message}"
+    }
+
+    private fun onBatchProgress(progress: BatchProgress) {
+        // 多个账号在后台线程并发回调：CAS 循环逐个重试，避免并发写把已完成数覆盖回去。
+        val next = BatchProgressUi(progress.done, progress.total, progress.nickname.ifEmpty { progress.uid })
+        while (true) {
+            val prev = _state.value
+            if (_state.compareAndSet(prev, prev.copy(batchProgress = next))) return
         }
+    }
+
+    /** 关闭批量结果面板。 */
+    fun dismissBatchOutcome() {
+        _state.value = _state.value.copy(batchOutcome = null)
     }
 
     fun performAction(providerId: String, uid: String, action: String, payload: JsonObject = JsonObject()) = action {
@@ -1098,19 +1247,16 @@ class AppViewModel(
     }
 
     /**
-     * 账号所属区域：WorkBuddy（workbuddy.ai = global）与 Trae（trae.ai = global），无区域概念返回空串。
+     * 账号所属区域（无区域概念的供应商返回空串）；判定统一走 provider 的
+     * [dev.aigw.core.provider.RegionAwareSupport.regionOf]——各家的凭证结构与区域字段口径
+     * 都不同（Trae 的 secret 是嵌套结构且存区域 id，WorkBuddy 是扁平结构且存主机名），
+     * UI 再解析一遍 secret 必然走样。
      */
     fun accountRegion(providerId: String, uid: String): String {
-        if (providerId != CodeBuddyProvider.ID && providerId != TraeProvider.ID) return ""
+        val provider = engine.registry.get(providerId) as? dev.aigw.core.provider.RegionAwareSupport
+            ?: return ""
         val account = engine.account(providerId, uid) ?: return ""
-        val domain = runCatching {
-            com.google.gson.JsonParser.parseString(account.secret).asJsonObject.get("domain")?.asString.orEmpty()
-        }.getOrDefault("").lowercase()
-        return when {
-            providerId == CodeBuddyProvider.ID ->
-                if (domain.endsWith("workbuddy.ai")) TraeRegion.INTL.id else CodeBuddyProvider.REGION_CN
-            else -> if (domain.endsWith("trae.ai")) TraeRegion.INTL.id else TraeRegion.CN.id
-        }
+        return provider.regionOf(account).orEmpty()
     }
 
     fun regenerateDeviceId(providerId: String, uid: String) = action {
@@ -1185,6 +1331,17 @@ class AppViewModel(
         }
     }
 
+    /** 拉取某账号的积分流水明细（会打上游）；支持账本的供应商才返回结果。 */
+    fun loadPointsBills(providerId: String, uid: String) {
+        viewModelScope.launch {
+            val view = withContext(Dispatchers.IO) { engine.pointsBills(providerId, uid) }
+            if (view == null) return@launch
+            _state.value = _state.value.copy(
+                pointsBills = _state.value.pointsBills + ("$providerId/$uid" to view),
+            )
+        }
+    }
+
     // ------------------------------------------------------------------ 数据管理
 
     /** 更新保留天数（越界由 core 夹回 1~3650）。 */
@@ -1192,17 +1349,6 @@ class AppViewModel(
         val clamped = GatewaySettings.clampRetentionDays(days)
         engine.updateSettings(engine.settings().copy(logRetentionDays = clamped))
         if (clamped != days) "保留天数需在 1~3650 之间，已按 $clamped 天保存" else "保留天数已设为 $clamped 天"
-    }
-
-    fun purgeExpiredRecords() = action(alsoRefreshStorage = true) {
-        val removed = engine.purgeExpiredRecords()
-        val days = engine.settings().logRetentionDays
-        if (removed == 0) "没有超过 $days 天的记录可清理" else "已清理 $removed 条过期记录"
-    }
-
-    fun truncateLongRecords() = action(alsoRefreshStorage = true) {
-        val (count, saved) = engine.truncateLongRecords()
-        if (count == 0) "没有超长记录需要截断" else "已截断 $count 条记录，释放约 ${StorageAudit.formatSize(saved)}"
     }
 
     // ------------------------------------------------------------------ 记录
@@ -1221,6 +1367,10 @@ class AppViewModel(
         engine.requestLog.clear()
         "请求日志已清空"
     }
+
+    /** 回读调用记录某字段的完整原文（溢出文件缺失时返回 null，调用方回落用摘要）。 */
+    fun engineFullText(id: String, field: dev.aigw.core.usage.CallTextField): String? =
+        engine.callLogStore.fullText(id, field)
 
     // ------------------------------------------------------------------ 关于与更新
 

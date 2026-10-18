@@ -60,7 +60,6 @@ import dev.aigw.app.ui.AppViewModel
 import dev.aigw.app.ui.AppearanceThemeScreen
 import dev.aigw.app.ui.CustomProviderScreen
 import dev.aigw.app.ui.CreditCenterScreen
-import dev.aigw.app.ui.DataManagementScreen
 import dev.aigw.app.ui.HomeScreen
 import dev.aigw.app.ui.KeepAliveScreen
 import dev.aigw.app.ui.LogsScreen
@@ -70,6 +69,7 @@ import dev.aigw.app.ui.ProviderDetailScreen
 import dev.aigw.app.ui.ProviderListScreen
 import dev.aigw.app.ui.ProviderCreditsScreen
 import dev.aigw.app.ui.ProxyScreen
+import dev.aigw.app.ui.ResilienceScreen
 import dev.aigw.app.ui.SecurityProtectionScreen
 import dev.aigw.app.ui.SubPage
 import dev.aigw.app.ui.TaskCenterScreen
@@ -242,7 +242,7 @@ private fun AppRoot(viewModel: AppViewModel, state: AppUiState) {
                 SubPage.Proxy -> ProxyScreen(state, viewModel) { subPage = null }
                 SubPage.ApiSettings -> ApiSettingsScreen(state, viewModel) { subPage = null }
                 SubPage.SecurityProtection -> SecurityProtectionScreen(state, viewModel) { subPage = null }
-                SubPage.DataManagement -> DataManagementScreen(state, viewModel) { subPage = null }
+                SubPage.Resilience -> ResilienceScreen(state, viewModel) { subPage = null }
                 SubPage.AppearanceTheme -> AppearanceThemeScreen(state, viewModel) { subPage = null }
                 null -> MainTabs(
                     viewModel = viewModel,

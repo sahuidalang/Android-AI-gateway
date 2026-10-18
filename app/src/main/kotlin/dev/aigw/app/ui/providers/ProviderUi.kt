@@ -6,6 +6,7 @@ import com.google.gson.JsonObject
 import dev.aigw.core.gateway.ProviderSettings
 import dev.aigw.core.pool.AccountStatus
 import dev.aigw.core.provider.ProviderTaskListView
+import dev.aigw.core.provider.PointsBillListView
 import dev.aigw.core.provider.QuotaPack
 
 /**
@@ -15,8 +16,13 @@ import dev.aigw.core.provider.QuotaPack
  * 因此新增/替换一个供应商的实现不会牵动页面骨架与其它供应商。
  */
 class ProviderUiActions(
-    /** 拉起 WebView 登录（Trae 回调型 / Antigravity OAuth）。 */
-    val onWebLogin: (providerId: String) -> Unit = {},
+    /**
+     * 拉起浏览器登录（Trae 回调型 / Antigravity OAuth / 小浣熊）。
+     *
+     * region 由组件按滑块传入：供应商设置是异步写入的，登录流程不能把正确性押在它上面
+     * （区域型供应商会按它选登录端点）。无区域概念时传空串。
+     */
+    val onWebLogin: (providerId: String, region: String) -> Unit = { _, _ -> },
     /** 设备授权登录（WorkBuddy）：拉起 WebView 并开始轮询；region 由组件按滑块传入。 */
     val onDeviceLogin: (providerId: String, region: String) -> Unit = { _, _ -> },
     /** 读供应商私有设置项（同步，取引擎内存值）。 */
@@ -38,8 +44,6 @@ class ProviderUiActions(
     val onRefreshCredits: (providerId: String, uid: String?) -> Unit = { _, _ -> },
     /** 执行供应商专属动作（签到、兑换码等）。 */
     val onAction: (providerId: String, uid: String, action: String, payload: JsonObject) -> Unit = { _, _, _, _ -> },
-    /** 重新检查设备授权状态（浏览器里已登录但轮询错过时手动重试）；region 与登录时一致。 */
-    val onCheckDeviceAuth: (providerId: String, region: String) -> Unit = { _, _ -> },
     val onToggleAccount: (providerId: String, uid: String, enabled: Boolean) -> Unit = { _, _, _ -> },
     val onRemoveAccount: (providerId: String, uid: String) -> Unit = { _, _ -> },
     /** 账号凭证级修改（如 Trae 的设备指纹）：直接替换 secret。 */
@@ -57,6 +61,10 @@ class ProviderUiActions(
     val taskListOf: (providerId: String, uid: String) -> ProviderTaskListView? = { _, _ -> null },
     /** 异步拉取账号的成长任务明细（打上游，结果回到 [taskListOf]）。 */
     val onLoadTaskList: (providerId: String, uid: String) -> Unit = { _, _ -> },
+    /** 读已拉取的积分流水明细（键 `providerId/uid`；需要拉取时调 [onLoadPointsBills]）。 */
+    val pointsBillsOf: (providerId: String, uid: String) -> PointsBillListView? = { _, _ -> null },
+    /** 异步拉取账号的积分流水明细（打上游，结果回到 [pointsBillsOf]）。 */
+    val onLoadPointsBills: (providerId: String, uid: String) -> Unit = { _, _ -> },
     /** 重新生成一套设备指纹（仅 Trae 用）。 */
     val onRegenerateDeviceId: (providerId: String, uid: String) -> Unit = { _, _ -> },
     /** 手动填入设备指纹（仅 Trae 用）。 */

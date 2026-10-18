@@ -11,7 +11,6 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
@@ -36,7 +35,7 @@ fun ProviderDetailScreen(
     onBack: () -> Unit,
     onEditCustom: (String) -> Unit,
 ) {
-    val ui = ProviderUiRegistry.require(providerId)
+    val ui = remember(providerId) { ProviderUiRegistry.require(providerId) }
     val info = state.providerOf(providerId)
     val accounts = state.accountsOf(providerId)
 
@@ -44,11 +43,12 @@ fun ProviderDetailScreen(
     // creditPacks/taskLists 随 state 变化，用 rememberUpdatedState 读取最新值。
     val creditPacks = rememberUpdatedState(state.creditPacks)
     val taskLists = rememberUpdatedState(state.taskLists)
+    val pointsBills = rememberUpdatedState(state.pointsBills)
     val actions = remember(viewModel, providerId) {
         ProviderUiActions(
             // 登录一律交给系统浏览器：本机 WebView 渲染异常（整页缩放错乱、输入框文字镜像），
             // 网关会在本地临时监听回调端口接住登录结果。
-            onWebLogin = { id -> viewModel.beginBrowserLogin(id) },
+            onWebLogin = { id, region -> viewModel.beginBrowserLogin(id, region) },
             onDeviceLogin = { id, region -> viewModel.beginDeviceLogin(id, region) },
             onSmsLogin = { id, phone, code, ccode, onResult ->
                 if (code.isEmpty()) {
@@ -68,7 +68,6 @@ fun ProviderDetailScreen(
             },
             onRefreshCredits = { id, uid -> viewModel.refreshCredits(id, uid) },
             onAction = { id, uid, action, payload -> viewModel.performAction(id, uid, action, payload) },
-            onCheckDeviceAuth = { id, region -> viewModel.checkDeviceAuth(id, region) },
             onToggleAccount = { id, uid, enabled -> viewModel.setAccountEnabled(id, uid, enabled) },
             onRemoveAccount = { id, uid -> viewModel.removeAccount(id, uid) },
             onUpdateSecret = { id, uid, secret, notice ->
@@ -85,6 +84,8 @@ fun ProviderDetailScreen(
             onLoadCreditPacks = { id, uid -> viewModel.loadCreditPacks(id, uid) },
             taskListOf = { id, uid -> taskLists.value["$id/$uid"] },
             onLoadTaskList = { id, uid -> viewModel.loadTaskList(id, uid) },
+            pointsBillsOf = { id, uid -> pointsBills.value["$id/$uid"] },
+            onLoadPointsBills = { id, uid -> viewModel.loadPointsBills(id, uid) },
             onRegenerateDeviceId = { id, uid -> viewModel.regenerateDeviceId(id, uid) },
             onSetDeviceId = { id, uid, value -> viewModel.setDeviceId(id, uid, value) },
             onNotice = { viewModel.notice(it) },
@@ -124,8 +125,8 @@ fun ProviderDetailScreen(
         if (accounts.isNotEmpty() && !ui.managesOwnAccounts) {
             SectionCard(enterIndex = 0) {
                 SectionLabel("账号")
-                accounts.forEachIndexed { index, account ->
-                    AccountRow(account, ui, actions, index = index)
+                PagedAccountList(accounts, keyOf = { it.uid }) { pageIndex, account ->
+                    AccountRow(account, ui, actions, index = pageIndex)
                 }
                 OutlineActionButton("刷新额度") { actions.onRefreshCredits(providerId, null) }
             }
@@ -144,39 +145,18 @@ private fun AccountRow(
     actions: ProviderUiActions,
     index: Int,
 ) {
-    Column(
+    AccountCardShell(
+        account = account,
+        providerId = account.providerId,
+        actions = actions,
         modifier = Modifier.fillMaxWidth().staggeredAppear(index),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Column(Modifier.weight(1f)) {
-                Text(
-                    text = account.nickname.ifEmpty { account.uid },
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.SemiBold,
-                )
-                // 额度与明细交给各供应商自己的组件展示（它们知道该怎么解读），这里只报状态
-                Text(
-                    text = accountStatusText(account),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+        extra = { ui.AccountExtra(account, actions) },
+        footer = {
+            Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                LinkText("删除账号") { actions.onRemoveAccount(account.providerId, account.uid) }
             }
-            Switch(
-                checked = account.enabled,
-                onCheckedChange = { actions.onToggleAccount(account.providerId, account.uid, it) },
-            )
-        }
-
-        ui.AccountExtra(account, actions)
-
-        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            LinkText("删除账号") { actions.onRemoveAccount(account.providerId, account.uid) }
-        }
-    }
+        },
+    )
 }
 
 @Composable

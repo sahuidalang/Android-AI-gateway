@@ -21,12 +21,12 @@ import dev.aigw.core.provider.StreamingChatCall
 import dev.aigw.core.provider.UpstreamError
 import dev.aigw.core.provider.queryParam
 import dev.aigw.core.protocol.OpenAiGemini
+import dev.aigw.core.util.HttpSupport
 import dev.aigw.core.util.arrayOrNull
 import dev.aigw.core.util.longOrNull
+import dev.aigw.core.util.newCompletionId
 import dev.aigw.core.util.objOrNull
 import dev.aigw.core.util.stringOrNull
-import java.io.ByteArrayOutputStream
-import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
@@ -48,6 +48,8 @@ class AntigravityProvider(
     private val apiBase: String = API_BASE,
     private val quotaBase: String = QUOTA_BASE,
     private val tokenEndpoint: String = TOKEN_ENDPOINT,
+    /** 运行时 UA 里的客户端版本；默认取官方清单的最新版（见 [AntigravityVersion]）。 */
+    private val clientVersion: () -> String = { AntigravityVersion.current() },
 ) : Provider, LoopbackOAuthSupport {
 
     override val id: String = ID
@@ -82,14 +84,24 @@ class AntigravityProvider(
                 fetchedAtMillis = nowMillis()
                 return ProviderModelCatalogView(models = fetched, fromFallback = false, error = "")
             }
-            // 若云端拉取失败但之前有成功缓存，继续回退使用之前的缓存，避免列表突然变空
+            // 若云端拉取失败但之前有成功缓存，继续回退使用之前的缓存，避免列表突然变空；
+            // 但这已不是本次拉取的结果，必须如实置位，界面据此标注「缓存」
             val previous = fetchedModels
             if (!previous.isNullOrEmpty()) {
-                return ProviderModelCatalogView(models = previous, fromFallback = false, error = "")
+                return ProviderModelCatalogView(
+                    models = previous,
+                    fromFallback = true,
+                    error = lastErr.ifEmpty { "上游未返回模型，展示上次成功的结果" },
+                )
             }
             return ProviderModelCatalogView(models = emptyList(), fromFallback = false, error = lastErr)
         }
         return ProviderModelCatalogView(models = emptyList(), fromFallback = false, error = "")
+    }
+
+    override fun invalidateModelCache() {
+        // 只让缓存过期（保留 fetchedModels 作失败兜底），下次 listModels 必然重拉上游
+        fetchedAtMillis = 0L
     }
 
     /**
@@ -130,7 +142,8 @@ class AntigravityProvider(
                     if (modelId.isEmpty() || EXCLUDED_MODELS.contains(modelId)) continue
                     val meta = value as? JsonObject
                     val displayName = meta?.stringOrNull("displayName").orEmpty().ifEmpty { modelId }
-                    val contextLength = meta?.longOrNull("maxTokens")?.takeIf { it > 0 } ?: DEFAULT_CONTEXT_LENGTH
+                    // 上游未给 maxTokens 时不填（0 = 界面不展示），不要拿一个常量冒充上下文窗口
+                    val contextLength = meta?.longOrNull("maxTokens")?.takeIf { it > 0 } ?: 0L
                     result.add(ProviderModel(modelId, displayName, contextLength))
                 }
                 if (result.isNotEmpty()) {
@@ -176,7 +189,7 @@ class AntigravityProvider(
         }
         val streaming = isStreaming(openAiBody)
         val model = resolveModel(requestedModel(openAiBody))
-        val request = OpenAiGemini.toGeminiRequest(openAiBody)
+        val request = OpenAiGemini.toGeminiRequest(openAiBody, model)
         // 非 claude 模型删 maxOutputTokens（上游 gemini 系不接受该字段，会 400）
         val isClaude = model.contains("claude", ignoreCase = true)
         if (!isClaude) {
@@ -199,7 +212,7 @@ class AntigravityProvider(
             return FailedChatCall(0, e.message ?: "连接失败")
         }
         if (status !in 200..299) {
-            val errorBody = runCatching { readLimited(conn.errorStream) }.getOrDefault("")
+            val errorBody = runCatching { HttpSupport.readLimited(conn.errorStream) }.getOrDefault("")
             conn.disconnect()
             return FailedChatCall(status, errorBody)
         }
@@ -304,8 +317,22 @@ class AntigravityProvider(
     @Volatile
     private var lastRefreshFailedAt: Map<String, Long> = emptyMap()
 
+    /**
+     * refresh_token 被上游吊销（`invalid_grant`）的账号。
+     *
+     * 这种失败**重试无用**：再用同一 refresh_token 打只会持续撞墙，并可能加重风控。
+     * 必须让账号降到不可用并提示重新登录——与 CLIProxyAPI 对 invalid_grant 按 401 处理
+     * 同一语义（其 issue #4130：「cooldown Antigravity credentials on invalid_grant
+     * instead of silent retry loop」）。
+     */
+    @Volatile
+    private var revokedAccounts: Set<String> = emptySet()
+
     override fun refreshAccount(account: ProviderAccount, skewSeconds: Long): ProviderAccount? {
         val credential = parse(account) ?: throw IllegalStateException("凭证无法解析，请重新登录")
+        if (account.uid in revokedAccounts) {
+            throw IllegalStateException("凭证已被上游吊销（refresh_token 无效），请重新登录")
+        }
         val nowSec = nowMillis() / 1000
         val hasExpiry = credential.expiresAt > 0
         val isExpired = hasExpiry && credential.expiresAt <= nowSec
@@ -338,6 +365,10 @@ class AntigravityProvider(
                 return updated
             }
             lastRefreshFailedAt = lastRefreshFailedAt + (uid to nowSec)
+            if (lastRefreshWasRevoked) {
+                revokedAccounts = revokedAccounts + uid
+                throw IllegalStateException("refresh_token 已被上游吊销（invalid_grant），请重新登录")
+            }
         }
         if (isExpired) {
             throw IllegalStateException("凭证已过期且刷新失败，稍后重试或重新登录")
@@ -360,6 +391,7 @@ class AntigravityProvider(
         synchronized(refreshLock) {
             if (lastRefreshed.containsKey(uid)) lastRefreshed = lastRefreshed - uid
             if (lastRefreshFailedAt.containsKey(uid)) lastRefreshFailedAt = lastRefreshFailedAt - uid
+            if (uid in revokedAccounts) revokedAccounts = revokedAccounts - uid
         }
     }
 
@@ -428,7 +460,12 @@ class AntigravityProvider(
         )
     }
 
+    /** 本次刷新的失败是否属于 refresh_token 被吊销（供调用方决定是否标记账号）。 */
+    @Volatile
+    private var lastRefreshWasRevoked = false
+
     private fun refreshAccessToken(credential: Credential): Credential? {
+        lastRefreshWasRevoked = false
         if (credential.refreshToken.isEmpty()) return null
         val form = mapOf(
             "client_id" to CLIENT_ID,
@@ -443,7 +480,14 @@ class AntigravityProvider(
             return null
         }
         if (status !in 200..299) {
-            hooks.onLog("Antigravity 刷新 Token 失败（HTTP $status）：${body.take(160)}")
+            // invalid_grant = refresh_token 已被上游吊销/失效：重试无用，需重新登录。
+            // 与 CLIProxyAPI issue #4130 的处理一致（按 401 语义降温，不静默重试）。
+            if (body.contains("invalid_grant")) {
+                lastRefreshWasRevoked = true
+                hooks.onLog("Antigravity refresh_token 已被吊销（invalid_grant），需要重新登录")
+            } else {
+                hooks.onLog("Antigravity 刷新 Token 失败（HTTP $status）：${body.take(160)}")
+            }
             return null
         }
         val obj = runCatching { JsonParser.parseString(body).asJsonObject }.getOrNull() ?: return null
@@ -498,56 +542,49 @@ class AntigravityProvider(
         return ""
     }
 
+    /** 当前生效的 User-Agent：版本随官方清单更新，不再写死。 */
+    private fun userAgent(): String = "antigravity/hub/${clientVersion()} darwin/arm64"
+
     private fun open(url: String, accessToken: String, body: String?): HttpURLConnection {
-        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-            requestMethod = if (body == null) "GET" else "POST"
-            connectTimeout = CONNECT_TIMEOUT_MS
-            readTimeout = READ_TIMEOUT_MS
-            instanceFollowRedirects = false
-            setRequestProperty("Accept-Encoding", "identity")
-            setRequestProperty("Authorization", "Bearer $accessToken")
-            setRequestProperty("User-Agent", USER_AGENT)
+        val headers = buildMap {
+            put("Authorization", "Bearer $accessToken")
+            put("User-Agent", userAgent())
+            if (body != null) put("Content-Type", "application/json")
         }
-        if (body != null) {
-            conn.doOutput = true
-            conn.setRequestProperty("Content-Type", "application/json")
-            val bytes = body.toByteArray(StandardCharsets.UTF_8)
-            conn.setFixedLengthStreamingMode(bytes.size)
-            conn.outputStream.use { it.write(bytes) }
-        }
-        return conn
+        return HttpSupport.open(
+            url = url,
+            method = if (body == null) "GET" else "POST",
+            headers = headers,
+            body = body,
+            connectTimeoutMs = CONNECT_TIMEOUT_MS,
+            readTimeoutMs = READ_TIMEOUT_MS,
+        )
     }
 
     private fun get(url: String, accessToken: String): Pair<Int, String> {
         val conn = open(url, accessToken, null)
         return try {
-            val status = conn.responseCode
-            val body = if (status in 200..299) readLimited(conn.inputStream) else readLimited(conn.errorStream)
-            status to body
+            conn.responseCode to HttpSupport.readBody(conn)
         } finally {
             conn.disconnect()
         }
     }
 
     private fun postJson(url: String, accessToken: String, body: String, connectTimeout: Int = CONNECT_TIMEOUT_MS, readTimeout: Int = READ_TIMEOUT_MS): Pair<Int, String> {
-        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            this.connectTimeout = connectTimeout
-            this.readTimeout = readTimeout
-            instanceFollowRedirects = false
-            setRequestProperty("Accept-Encoding", "identity")
-            setRequestProperty("Authorization", "Bearer $accessToken")
-            setRequestProperty("User-Agent", USER_AGENT)
-            doOutput = true
-            setRequestProperty("Content-Type", "application/json")
-            val bytes = body.toByteArray(StandardCharsets.UTF_8)
-            setFixedLengthStreamingMode(bytes.size)
-            outputStream.use { it.write(bytes) }
-        }
+        val conn = HttpSupport.open(
+            url = url,
+            method = "POST",
+            headers = mapOf(
+                "Authorization" to "Bearer $accessToken",
+                "User-Agent" to userAgent(),
+                "Content-Type" to "application/json",
+            ),
+            body = body,
+            connectTimeoutMs = connectTimeout,
+            readTimeoutMs = readTimeout,
+        )
         return try {
-            val status = conn.responseCode
-            val response = if (status in 200..299) readLimited(conn.inputStream) else readLimited(conn.errorStream)
-            status to response
+            conn.responseCode to HttpSupport.readBody(conn)
         } finally {
             conn.disconnect()
         }
@@ -570,7 +607,7 @@ class AntigravityProvider(
             conn.setFixedLengthStreamingMode(bytes.size)
             conn.outputStream.use { it.write(bytes) }
             val status = conn.responseCode
-            val body = if (status in 200..299) readLimited(conn.inputStream) else readLimited(conn.errorStream)
+            val body = if (status in 200..299) HttpSupport.readLimited(conn.inputStream) else HttpSupport.readLimited(conn.errorStream)
             status to body
         } finally {
             conn.disconnect()
@@ -619,22 +656,6 @@ class AntigravityProvider(
         }
         obj.get("message")?.asString?.takeIf { it.isNotEmpty() }?.let { return it }
         return ""
-    }
-
-    private fun readLimited(input: InputStream?): String {
-        if (input == null) return ""
-        val out = ByteArrayOutputStream()
-        val buffer = ByteArray(8192)
-        while (true) {
-            val read = input.read(buffer)
-            if (read < 0) break
-            if (out.size() + read > MAX_BODY_BYTES) {
-                out.write(buffer, 0, MAX_BODY_BYTES - out.size())
-                break
-            }
-            out.write(buffer, 0, read)
-        }
-        return out.toString("UTF-8")
     }
 
     private fun requestedModel(body: String): String =
@@ -810,9 +831,6 @@ class AntigravityProvider(
         runCatching { JsonParser.parseString(body).asJsonObject.get("stream")?.asBoolean ?: false }
             .getOrDefault(false)
 
-    private fun newCompletionId(): String =
-        "chatcmpl-" + UUID.randomUUID().toString().replace("-", "").take(24)
-
     private fun encode(value: String): String = URLEncoder.encode(value, "UTF-8")
 
     private data class Tokens(val accessToken: String, val refreshToken: String, val expiresAt: Long)
@@ -862,9 +880,12 @@ class AntigravityProvider(
         )
 
         private const val MODEL_CACHE_TTL_MILLIS = 10L * 60 * 1000
-        private const val DEFAULT_CONTEXT_LENGTH = 1_048_576L
 
-        const val USER_AGENT = "antigravity/hub/2.9.1 darwin/arm64"
+        /**
+         * 运行时 UA 的兜底版本（版本号本身动态化，见 [AntigravityVersion]）。
+         * 保留常量仅供测试与文档引用，业务代码请用 [AntigravityVersion.userAgent]。
+         */
+        const val USER_AGENT = "antigravity/hub/2.23.0 darwin/arm64"
 
         val SCOPES = listOf(
             "https://www.googleapis.com/auth/cloud-platform",
@@ -910,6 +931,5 @@ class AntigravityProvider(
 
         private const val CONNECT_TIMEOUT_MS = 30_000
         private const val READ_TIMEOUT_MS = 300_000
-        private const val MAX_BODY_BYTES = 1 shl 20
     }
 }

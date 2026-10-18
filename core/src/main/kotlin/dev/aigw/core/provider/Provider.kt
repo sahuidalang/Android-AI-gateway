@@ -30,6 +30,9 @@ enum class ProviderCapability {
 
     /** 有可批量执行的「任务」（如 Loomy 的新手任务）。 */
     TASKS,
+
+    /** 有积分/额度流水账本，可查逐笔明细（如小浣熊的积分流水）。 */
+    POINTS_BILLS,
 }
 
 /** 供应商专属动作（provider 实现 [Provider.performAction]，UI 组件按名字调用）。 */
@@ -82,6 +85,14 @@ interface Provider {
     /** 模型目录；无账号或拉取失败时返回空列表。 */
     fun listModels(account: ProviderAccount?): ProviderModelCatalogView
 
+    /**
+     * 丢弃模型目录缓存，下次 [listModels] 必须重新打上游（界面刷新按钮用）。
+     *
+     * 实现方应保留最后一次成功结果作为失败兜底：本方法只保证不再命中缓存，
+     * 不保证上游此刻可用。
+     */
+    fun invalidateModelCache() = Unit
+
     /** 把客户端传来的模型名归一化为上游真实名；查不到原样放行，交给上游判定。 */
     fun resolveModel(requested: String): String
 
@@ -110,6 +121,13 @@ interface Provider {
      * 不发任何写操作，供 UI 展示「有哪些任务、哪些做了、哪些没做」。
      */
     fun taskList(account: ProviderAccount): ProviderTaskListView? = null
+
+    /**
+     * 积分/额度流水明细（可选）；不支持账本的 provider 返回 null。
+     *
+     * 与 [creditPacks] 的分工：后者是「还剩多少」的额度包视角，这里是「每一笔怎么来的」流水视角。
+     */
+    fun pointsBills(account: ProviderAccount): PointsBillListView? = null
 
     /**
      * 该供应商用到的上游域名后缀（不带子域前缀）。

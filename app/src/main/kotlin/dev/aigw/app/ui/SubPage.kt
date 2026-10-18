@@ -30,7 +30,8 @@ sealed interface SubPage {
     /** 安全防护：反审核脱敏与账号级限速。 */
     data object SecurityProtection : SubPage
 
-    data object DataManagement : SubPage
+    /** 并发与容错：并发闸门、重试退避与熔断器。 */
+    data object Resilience : SubPage
 
     /** 外观主题：明暗模式、配色方案与金色文字。 */
     data object AppearanceTheme : SubPage

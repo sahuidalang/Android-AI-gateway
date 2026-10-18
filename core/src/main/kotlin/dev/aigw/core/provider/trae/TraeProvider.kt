@@ -26,7 +26,7 @@ import dev.aigw.core.provider.isStreamingBody
 import dev.aigw.core.provider.queryParam
 import dev.aigw.core.provider.requestedModelOf
 import dev.aigw.core.store.KeyValueStore
-import java.util.UUID
+import dev.aigw.core.util.newCompletionId
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -68,7 +68,7 @@ class TraeProvider(
     private fun authClient(region: TraeRegion): TraeAuthClient = authClientSingleton
 
     private fun checkinClient(region: TraeRegion): TraeCheckinClient =
-        checkinClients.computeIfAbsent(region) { TraeCheckinClient(version(), region.ugHost) }
+        checkinClients.computeIfAbsent(region) { TraeCheckinClient(version(), region.ugHost, region) }
 
     private fun catalog(region: TraeRegion): TraeModelCatalog =
         catalogs.computeIfAbsent(region) { TraeModelCatalog(chatClient(region), nowMillis) }
@@ -132,6 +132,10 @@ class TraeProvider(
         )
     }
 
+    override fun invalidateModelCache() {
+        for (catalog in catalogs.values) catalog.invalidate()
+    }
+
     override fun resolveModel(requested: String): String {
         val model = requested.trim()
         if (model.isEmpty() || model == "auto") return defaultModel()
@@ -141,7 +145,16 @@ class TraeProvider(
 
     override fun isInternalModel(id: String): Boolean = TraeModelCatalog.isInternal(id)
 
-    override fun hosts(): List<String> = listOf("trae-api-cn.mchost.guru", "api.trae.com.cn", "api.trae.cn")
+    /**
+     * 上游域名后缀（代理分流的判定依据），从区域定义推导，避免手写清单与区域脱节。
+     *
+     * 只列网关自己会出站访问的 host（agent / 额度 / 鉴权）：登录页由系统浏览器打开，不走这里。
+     */
+    override fun hosts(): List<String> =
+        TraeRegion.entries
+            .flatMap { listOf(it.agentHost, it.ugHost, it.oauthHost) }
+            .map { it.removePrefix("https://") }
+            .distinct()
 
     // ------------------------------------------------------------------ 对话
 
@@ -261,10 +274,12 @@ class TraeProvider(
         val trae = parseOrNull(account) ?: return null
         return try {
             val usage = checkinClient(regionOfAccount(account)).entUsage(trae)
-            if (usage.parsed) {
+            // 命中权益包列表还不够：包内字段缺失时 limit/remain 都是 0，报 known=true 就成了「额度真是 0」
+            if (usage.parsed && usage.limit > 0) {
                 CreditInfo(usage.remain, known = true, detail = "权益包剩余 ${usage.remain} / ${usage.limit}")
             } else {
-                CreditInfo(0, known = false, detail = "上游未返回可解析的额度")
+                val reason = if (usage.parsed) "上游返回的权益包没有可解析的额度" else "上游未返回可解析的额度"
+                CreditInfo(0, known = false, detail = reason)
             }
         } catch (e: TraeHttpException) {
             CreditInfo(0, known = false, detail = e.message ?: "刷新额度失败")
@@ -467,8 +482,6 @@ class TraeProvider(
     private fun parseOrNull(account: ProviderAccount): TraeAccount? =
         runCatching { TraeAccount.parse(account.secret) }.getOrNull()
 
-    private fun newCompletionId(): String = "chatcmpl-" + UUID.randomUUID().toString().replace("-", "").take(24)
-
     companion object {
         const val ID = "trae"
 
@@ -497,6 +510,7 @@ internal fun traeErrorMessage(e: TraeHttpException): String = when (e.upstreamCo
 }
 
 internal fun TraeErrorKind.toErrorKind(): ErrorKind = when (this) {
+    TraeErrorKind.MODEL_LIMIT -> ErrorKind.MODEL_LIMIT
     TraeErrorKind.PLAN_LIMIT -> ErrorKind.QUOTA
     TraeErrorKind.SOFT_RATE -> ErrorKind.SOFT_RATE
     TraeErrorKind.NOT_FOUND -> ErrorKind.NOT_FOUND
