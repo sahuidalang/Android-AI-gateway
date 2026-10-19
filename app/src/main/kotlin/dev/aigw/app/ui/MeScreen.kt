@@ -29,14 +29,20 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import dev.aigw.app.ui.theme.LocalAppColors
 import dev.aigw.app.ui.theme.formatHex
 import dev.aigw.core.usage.StorageAudit
+import dev.aigw.core.usage.UsageStats
 import java.util.Locale
 
 @Composable
@@ -332,8 +338,6 @@ fun UsageScreen(state: AppUiState, viewModel: AppViewModel, onBack: () -> Unit) 
     // 存储占用不挂在全局 refresh 里（要扫全量存储键并解密，代价高），
     // 本页「存储」卡片读的是 state 里的同一份，不主动刷新会恒为 0，故进入本页时算一次。
     LaunchedEffect(Unit) { viewModel.refreshStorage() }
-    val todayCacheHit = cacheHitSuffix(state.today.cachedTokens, state.today.cacheHitPercent)
-    val totalCacheHit = cacheHitSuffix(state.total.cachedTokens, state.total.cacheHitPercent)
     PageScaffold(
         title = "用量统计",
         subtitle = "累计与今日",
@@ -348,32 +352,24 @@ fun UsageScreen(state: AppUiState, viewModel: AppViewModel, onBack: () -> Unit) 
     ) {
         SectionCard(enterIndex = 3) {
             SectionLabel("今日")
+            CacheHitGauge(state.today)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                 StatCell(formatCount(state.today.requests), "请求")
                 StatCell(formatCount(state.today.success), "成功")
                 StatCell(formatCount(state.today.failed), "失败")
                 StatCell(formatCount(state.today.aborted), "中断")
             }
-            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
-            TokenUsageRow("输入 Tokens", state.today.promptTokens, MaterialTheme.colorScheme.primary)
-            TokenUsageRow("缓存命中 Tokens", state.today.cachedTokens, MaterialTheme.colorScheme.primary, suffix = todayCacheHit)
-            TokenUsageRow("输出 Tokens", state.today.completionTokens, MaterialTheme.colorScheme.tertiary)
-            TokenUsageRow("总计 Tokens", state.today.totalTokens, MaterialTheme.colorScheme.secondary)
         }
 
         SectionCard(enterIndex = 4) {
             SectionLabel("累计")
+            CacheHitGauge(state.total)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                 StatCell(formatCount(state.total.requests), "请求")
                 StatCell(formatCount(state.total.success), "成功")
                 StatCell(formatCount(state.total.failed), "失败")
                 StatCell(formatCount(state.total.aborted), "中断")
             }
-            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
-            TokenUsageRow("输入 Tokens", state.total.promptTokens, MaterialTheme.colorScheme.primary)
-            TokenUsageRow("缓存命中 Tokens", state.total.cachedTokens, MaterialTheme.colorScheme.primary, suffix = totalCacheHit)
-            TokenUsageRow("输出 Tokens", state.total.completionTokens, MaterialTheme.colorScheme.tertiary)
-            TokenUsageRow("总计 Tokens", state.total.totalTokens, MaterialTheme.colorScheme.secondary)
         }
 
         SectionCard(enterIndex = 5) {
@@ -387,71 +383,116 @@ fun UsageScreen(state: AppUiState, viewModel: AppViewModel, onBack: () -> Unit) 
     }
 }
 
-
-/** 方案 C：用量统计单项明细行 */
+/**
+ * 输入 token 构成环：命中缓存 / 未命中 / 输出 三段按比例分色填充，中心显示命中率。
+ *
+ * 环形绘制借鉴 open-claude-ui（MIT, Caho1）的 Token 仪表做法：
+ * `strokeDasharray = 2πr`、`strokeDashoffset = circumference × (1 − ratio)`，
+ * 各段用 offset 依次错开。没有输入 token 时只显示「—」，不画环（不编造 0%）。
+ */
 @Composable
-private fun TokenUsageRow(
-    label: String,
-    tokens: Long,
-    indicatorColor: androidx.compose.ui.graphics.Color,
-    suffix: String? = null,
-) {
+private fun CacheHitGauge(stats: UsageStats) {
+    val hitColor = MaterialTheme.colorScheme.tertiary
+    val missColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.55f)
+    val outputColor = MaterialTheme.colorScheme.secondary.copy(alpha = 0.75f)
+    val trackColor = MaterialTheme.colorScheme.surfaceVariant
+    val hit = stats.cachedTokens.coerceAtMost(stats.promptTokens)
+    val miss = (stats.promptTokens - hit).coerceAtLeast(0)
+    val output = stats.completionTokens
+    val total = hit + miss + output
+    val percent = stats.cacheHitPercent
     Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 4.dp),
+        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween,
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(8.dp)
-                    .clip(CircleShape)
-                    .background(indicatorColor),
-            )
+        Box(contentAlignment = Alignment.Center) {
+            Canvas(Modifier.size(72.dp)) {
+                val stroke = 7.dp.toPx()
+                val inset = stroke / 2
+                val arcSize = Size(size.width - stroke, size.height - stroke)
+                val topLeft = Offset(inset, inset)
+                // 轨道
+                drawArc(
+                    color = trackColor,
+                    startAngle = -90f,
+                    sweepAngle = 360f,
+                    useCenter = false,
+                    topLeft = topLeft,
+                    size = arcSize,
+                    style = Stroke(width = stroke, cap = StrokeCap.Round),
+                )
+                if (total > 0L) {
+                    var start = -90f
+                    for ((value, color) in listOf(
+                        hit to hitColor,
+                        miss to missColor,
+                        output to outputColor,
+                    )) {
+                        if (value <= 0L) continue
+                        val sweep = 360f * value / total.toFloat()
+                        // 段间留 2° 缝隙，避免同色相邻时粘成一团
+                        val gap = if (sweep > 6f) 2f else 0f
+                        drawArc(
+                            color = color,
+                            startAngle = start + gap / 2,
+                            sweepAngle = (sweep - gap).coerceAtLeast(0f),
+                            useCenter = false,
+                            topLeft = topLeft,
+                            size = arcSize,
+                            style = Stroke(width = stroke, cap = StrokeCap.Round),
+                        )
+                        start += sweep
+                    }
+                }
+            }
             Text(
-                text = label,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                text = if (percent != null) "${String.format(Locale.US, "%.0f", percent)}%" else "—",
+                style = MaterialTheme.typography.titleMedium.copy(fontFamily = FontFamily.Monospace),
+                color = MaterialTheme.colorScheme.onSurface,
+                fontWeight = FontWeight.SemiBold,
             )
         }
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
+        // 没有任何 token 数据时只留一个空环 + 「—」：图例全为 0 没有信息量，还会与上方的请求数重复
+        if (total > 0L) {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.weight(1f)) {
+                GaugeLegend("命中缓存", hit, hitColor)
+                GaugeLegend("未命中", miss, missColor)
+                GaugeLegend("输出", output, outputColor)
+            }
+        } else {
             Text(
-                text = formatCount(tokens),
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.onSurface,
+                text = "还没有 token 用量",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f),
             )
-            if (tokens >= 1_000L) {
-                Text(
-                    text = formatTokens(tokens),
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.Medium,
-                    color = MaterialTheme.colorScheme.primary,
-                )
-            }
-            if (suffix != null) {
-                Text(
-                    text = suffix,
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.Medium,
-                    color = MaterialTheme.colorScheme.secondary,
-                )
-            }
         }
     }
 }
 
-/** 缓存命中率后缀：没有缓存数据时返回 null（不显示百分比，也不显示占位符号）。 */
-private fun cacheHitSuffix(cachedTokens: Long, percent: Double?): String? =
-    if (cachedTokens > 0 && percent != null) String.format(Locale.US, "（%.0f%%）", percent) else null
+@Composable
+private fun GaugeLegend(label: String, tokens: Long, color: androidx.compose.ui.graphics.Color) {
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Box(
+            Modifier
+                .size(7.dp)
+                .clip(androidx.compose.foundation.shape.CircleShape)
+                .background(color),
+        )
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.weight(1f),
+        )
+        Text(
+            text = formatTokens(tokens),
+            style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+    }
+}
 
 /**
  * 「并发与容错」入口的右侧元信息。
