@@ -1,9 +1,5 @@
 # AI Gateway 架构地图（接盘必读）
 
-> ## ⚠️ 已更新至 v2.13.1 版本的用户需点击项目仓库下载更新，因为应用内更新有 bug
->
-> v2.13.1 及更早的应用内更新实现缺少 `android.permission.REQUEST_INSTALL_PACKAGES` 声明，点「安装」不会跳出系统安装器（`canRequestPackageInstalls()` 恒为 false，且系统「安装未知应用」列表里不会出现本应用）。这些版本只能到 [Releases](https://github.com/xibai6668/Android-AI-gateway/releases/latest) 手动下载 APK 安装。
-
 > 本文档是整个系统的完整认知地图。它回答四个问题：**这个软件是干什么的、它是怎么工作的、每个模块为什么存在、改代码时什么能碰什么不能碰。**
 > 任何修改前请先读完本文档；本文档与代码不一致时，以代码为准并同步更新本文档。
 
@@ -88,7 +84,7 @@
 | `provider/Provider.kt` | Provider 接口 + AuthKind 枚举 | 抽象边界，勿随意扩接口 |
 | `provider/ChatCall.kt` | 上游响应封装（stream/aggregated/failure 三态） | |
 | `provider/StreamSupport.kt` | `LineTransformStream`（逐行翻译）、`OpenAiSseAggregator`（SSE聚合/completionAsSse/isEmptyCompletion） | SSE 帧必须以 `\n\n` 结尾 |
-| `provider/antigravity/` | Google Antigravity（Gemini 协议）| **凭证策略见下文第 5 节，严禁回退** |
+| `provider/antigravity/` | Google Antigravity（Gemini 协议）| **凭证策略见下文第 5 节，严禁回退**；额度查询完全对接 CLIProxyAPI |
 | `provider/codebuddy/` | 腾讯 WorkBuddy（国内 copilot.tencent.com / 国际 workbuddy.ai）| 上游拒绝非流式，必须 stream:true |
 | `provider/trae/` | 字节 Trae SOLO 通道（最重的协议转换）| |
 | `provider/loomy/` | 讯飞 Loomy（HTTP 200 + 业务码陷阱）| |
@@ -200,6 +196,18 @@ Google 对同一个 refresh_token 的高频 token 换新有风控。0.1.53~0.1.5
 - 非claude模型删除 `generationConfig.maxOutputTokens`（上游不接受）。
 - envelope：`{project, model, userAgent:"antigravity", requestType:"agent", requestId, request:{...sessionId}}`；sessionId 从首条 user 文本 SHA256 稳定派生。
 - 请求头白名单：Content-Type / Authorization / UA(`antigravity/hub/2.9.1 darwin/arm64`)。多余的 X-Goog-Api-Client 等头会被识别。
+- **配额口径（`retrieveUserQuotaSummary`，2026-10 起）**：共享池只有两组 —— `Gemini Models`（`gemini-5h`/`gemini-weekly`，Gemini 4 Argon、3.x Pro/Flash、Image 共用）与 `Claude and GPT models`（`3p-5h`/`3p-weekly`）。
+  - **Gemini 4 Argon 有独立的周日额度**（bucketId 形如 `gemini-argon-wtu-weekly` / `gemini-4-argon`，仅周窗口）。它是**模型级**配额：耗尽只影响 argon 模型，绝不能拿来当账号级余额，否则选号会把还有额度的账号判死（同「错误作用域」铁律）。
+  - 周配额耗尽时，Google 会把对应 5h 桶标 `disabled: true` 且 `remainingFraction: 1`；这类桶必须跳过，否则界面会出现一条「0% 使用」的假进度条。
+  - 账号级余额 = 共享池最紧窗口；模型专属池单独以 `QuotaPack.scope`（「仅 gemini-4-argon」）展示，并写进 `creditInfo.detail` 的「独立配额」段。
+  - **额度/订阅查询完全对接 CLIProxyAPI**（`antigravity_executor_credits.go` / `antigravity_executor_request.go`，MIT）：
+    - `loadCodeAssist` 与 `retrieveUserQuotaSummary` 一律用裸 hub UA `antigravity/hub/<ver> darwin/arm64`，base 固定 `daily-cloudcode-pa`；
+    - `loadCodeAssist` 的 metadata **只带 `ideType=ANTIGRAVITY`**（不带 platform/pluginType）；
+    - 只发 `Authorization` / `Content-Type` / `User-Agent` 三个头，不发 `X-Goog-Api-Client` / `Client-Metadata`；
+    - 失败回退：剥 `project` 重试 → sandbox → prod；只有 401 才报登录失效，403 报真实状态码。
+    > 历史弯路（不要再重复）：曾试过 `antigravity/cli/<ver>`、带 `(aidev_client; cl=..)` 段的完整 hub 形态、`ideType` 在 `ANTIGRAVITY`/`IDE_UNSPECIFIED` 间探测、给 metadata 补齐 `platform`/`pluginType`——这些都没能解决 #3501，且客户端形态已被官方论坛证伪（同一账号官方 IDE 正常、直连 API 仍 403）。
+  - `resolveModel` 先查「模型目录里真有的 id」再做子串路由：`gemini-4-argon` 含 `pro`，否则会被改写成 `gemini-pro-agent`。
+  - **额度查询路径的 403 不等于登录失效**：403 常见于权限/订阅分流（free-tier 访问部分 RPC 返回 `SUBSCRIPTION_REQUIRED`），此时应降级继续查配额并把真实状态码写进 detail；只有 401 才是重新登录。对话路径的 `classify` 仍保持 401/403 → `SESSION_DEAD`（见第 5 节铁律，勿改）。
 
 ### 腾讯 WorkBuddy
 - 上游**拒绝非流式**：必须强制 `stream:true`，网关侧聚合。

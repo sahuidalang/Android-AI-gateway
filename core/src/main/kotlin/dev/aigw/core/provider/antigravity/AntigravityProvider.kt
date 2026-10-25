@@ -164,6 +164,9 @@ class AntigravityProvider(
         }
         val lower = model.lowercase()
         return when {
+            // 先认「列表里真有的模型」：gemini-4-argon 含 pro 子串，若按 contains 判断会被改写成
+            // gemini-pro-agent，用户选的模型就悄悄变了
+            fetchedModels?.any { it.id.equals(model, ignoreCase = true) } == true -> model
             lower.contains("flash") -> "gemini-3.8-flash-high"
             lower.contains("pro") -> "gemini-pro-agent"
             lower.contains("claude") || lower.contains("sonnet") || lower.contains("opus") -> "claude-sonnet-4-6"
@@ -262,13 +265,21 @@ class AntigravityProvider(
         val (paidStatus, paidBody) = try {
             loadPaidCredits(credential.accessToken)
         } catch (e: Exception) {
-            return CreditInfo(0, known = false, detail = "查询积分失败：${e.message}")
+            // 积分端点失败不代表不能查配额，先降级继续
+            return quotaCreditInfo(credential, "订阅未知", prefix = "查询积分失败：${e.message}；")
         }
         when {
-            paidStatus == 401 || paidStatus == 403 ->
+            // 额度查询与对话路径的策略不同：这里的 403 常见于权限/订阅分流
+            // （如 free-tier 访问部分 RPC 会回 SUBSCRIPTION_REQUIRED），报成「登录已失效」
+            // 会让用户白白重登一遍；只有 401 才是凭证真的无效。
+            paidStatus == 401 ->
                 return CreditInfo(0, known = false, detail = "登录状态已失效，需要重新登录")
             paidStatus !in 200..299 ->
-                return CreditInfo(0, known = false, detail = "查询积分失败（HTTP $paidStatus）：${paidBody.take(200)}")
+                return quotaCreditInfo(
+                    credential,
+                    "订阅未知",
+                    prefix = "查询积分失败（HTTP $paidStatus）：${paidBody.take(120)}；",
+                )
         }
         val assist = parsePaidAssist(paidBody)
         if (assist?.credits != null) {
@@ -287,12 +298,11 @@ class AntigravityProvider(
         }
         val tierLabel = assist?.tierLabel ?: "订阅未知"
         val packs = mutableListOf<QuotaPack>()
-        // 模型组配额：所有账号都有（会员的订阅配额 / 免费版的基础配额）
-        try {
-            val (status, body) = loadQuotaSummary(credential.accessToken, credential.projectId)
-            if (status in 200..299) packs += quotaPacks(body, tierLabel)
-        } catch (_: Exception) {
-        }
+        // 模型组配额是 best-effort：这层失败不能拖垮整个额度包列表（积分仍要展示）
+        runCatching { loadQuotaSummary(credential.accessToken, credential.projectId) }
+            .getOrNull()
+            ?.takeIf { it.first in 200..299 }
+            ?.let { (_, body) -> packs += quotaPacks(body, tierLabel) }
         // Google One 积分：仅订阅用户有
         if (assist?.credits != null) {
             packs += QuotaPack(name = "Google One AI 积分", group = tierLabel, remain = assist.credits)
@@ -516,13 +526,7 @@ class AntigravityProvider(
 
     /** `loadCodeAssist` 取 project id；字段名以响应为准，做宽容提取。 */
     private fun fetchProjectId(accessToken: String): String {
-        val payload = JsonObject().apply {
-            add("metadata", JsonObject().apply {
-                addProperty("ideType", "IDE_UNSPECIFIED")
-                addProperty("platform", "PLATFORM_UNSPECIFIED")
-                addProperty("pluginType", "GEMINI")
-            })
-        }.toString()
+        val payload = JsonObject().apply { add("metadata", loadCodeAssistMetadata()) }.toString()
         val (status, body) = try {
             postJson("$apiBase/$API_VERSION:loadCodeAssist", accessToken, payload)
         } catch (_: Exception) {
@@ -544,6 +548,28 @@ class AntigravityProvider(
 
     /** 当前生效的 User-Agent：版本随官方清单更新，不再写死。 */
     private fun userAgent(): String = "antigravity/hub/${clientVersion()} darwin/arm64"
+
+    /**
+     * 额度/订阅查询（完全对接 CLIProxyAPI 的做法）。
+     *
+     * 对齐 `internal/runtime/executor/antigravity_executor_credits.go` 与
+     * `antigravity_executor_request.go`（MIT, router-for-me）：
+     * - 只发 Authorization / Content-Type / User-Agent 三个头，不发任何指纹头；
+     * - UA 用裸 hub 形态 `antigravity/hub/<ver> darwin/arm64`；
+     * - base 固定 `daily-cloudcode-pa`；
+     * - loadCodeAssist 的 metadata **只带 ideType=ANTIGRAVITY**（不带 platform/pluginType）。
+     */
+    private fun loadPaidCredits(accessToken: String): Pair<Int, String> {
+        val payload = JsonObject().apply {
+            add("metadata", JsonObject().apply { addProperty("ideType", "ANTIGRAVITY") })
+        }.toString()
+        return postJson(
+            "$quotaBase/$API_VERSION:loadCodeAssist",
+            accessToken,
+            payload,
+            userAgent = userAgent(),
+        )
+    }
 
     private fun open(url: String, accessToken: String, body: String?): HttpURLConnection {
         val headers = buildMap {
@@ -570,13 +596,20 @@ class AntigravityProvider(
         }
     }
 
-    private fun postJson(url: String, accessToken: String, body: String, connectTimeout: Int = CONNECT_TIMEOUT_MS, readTimeout: Int = READ_TIMEOUT_MS): Pair<Int, String> {
+    private fun postJson(
+        url: String,
+        accessToken: String,
+        body: String,
+        connectTimeout: Int = CONNECT_TIMEOUT_MS,
+        readTimeout: Int = READ_TIMEOUT_MS,
+        userAgent: String = userAgent(),
+    ): Pair<Int, String> {
         val conn = HttpSupport.open(
             url = url,
             method = "POST",
             headers = mapOf(
                 "Authorization" to "Bearer $accessToken",
-                "User-Agent" to userAgent(),
+                "User-Agent" to userAgent,
                 "Content-Type" to "application/json",
             ),
             body = body,
@@ -662,53 +695,82 @@ class AntigravityProvider(
         runCatching { JsonParser.parseString(body).asJsonObject.get("model")?.asString.orEmpty() }
             .getOrDefault("")
 
-    /** CLIProxyAPI 同款请求体：只要 ideType=ANTIGRAVITY，响应里带 paidTier 的积分明细。 */
-    private fun loadPaidCredits(accessToken: String): Pair<Int, String> {
-        val payload = JsonObject().apply {
-            add("metadata", JsonObject().apply { addProperty("ideType", "ANTIGRAVITY") })
-        }.toString()
-        return postJson("$apiBase/$API_VERSION:loadCodeAssist", accessToken, payload)
+    /** 登录与额度查询共用的 loadCodeAssist 客户端身份（CLIProxyAPI 同款：只带 ideType）。 */
+    private fun loadCodeAssistMetadata(): JsonObject = JsonObject().apply {
+        addProperty("ideType", "ANTIGRAVITY")
     }
 
     /**
-     * 模型组配额（桌面 App 展示的「Weekly Limit / Five Hour Limit」）。必须走 daily- 前缀域名：
-     * 非前缀域名对 Gemini 组永远返回 remainingFraction=1（错误数据，见 agy 语言服务器日志）。
+     * 模型组配额（桌面 App 展示的「Weekly Limit / Five Hour Limit」）。
+     *
+     * 对接 CLIProxyAPI：base 固定 `daily-cloudcode-pa`，请求体带 `project`（拿不到就空体），
+     * 失败时按 剥 project → sandbox → prod 的顺序回退。
      */
     private fun loadQuotaSummary(accessToken: String, projectId: String): Pair<Int, String> {
-        val payload = if (projectId.isEmpty()) {
-            "{}"
-        } else {
-            JsonObject().apply { addProperty("project", projectId) }.toString()
+        // 只有用默认域名时才回退到 sandbox/prod；显式传了 base（单测的假上游）就只打它
+        val bases = if (quotaBase == QUOTA_BASE) listOf(quotaBase) + QUOTA_FALLBACK_BASES else listOf(quotaBase)
+        var last: Pair<Int, String> = 0 to ""
+        // 两种请求体都试：带 project 的完整形态，与空体（#3501 常见于 project 授权校验失败）
+        val payloads = LinkedHashSet<String>().apply {
+            if (projectId.isNotEmpty()) {
+                add(JsonObject().apply { addProperty("project", projectId) }.toString())
+            }
+            add("{}")
         }
-        return postJson("$quotaBase/$API_VERSION:retrieveUserQuotaSummary", accessToken, payload)
+        for (base in bases) {
+            for (payload in payloads) {
+                val url = "$base/$API_VERSION:retrieveUserQuotaSummary"
+                val result = postJson(url, accessToken, payload, userAgent = userAgent())
+                if (result.first == 401 || result.first in 200..299) return result
+                last = result
+            }
+        }
+        return last
     }
 
     /** 无积分可显示时，账号卡片余额取最紧窗口的剩余百分比，detail 标注订阅层级。 */
-    private fun quotaCreditInfo(credential: Credential, tierLabel: String): CreditInfo {
+    private fun quotaCreditInfo(credential: Credential, tierLabel: String, prefix: String = ""): CreditInfo {
         val (status, body) = try {
             loadQuotaSummary(credential.accessToken, credential.projectId)
         } catch (e: Exception) {
-            return CreditInfo(0, known = false, detail = "$tierLabel · 查询配额失败：${e.message}")
+            return CreditInfo(0, known = false, detail = "${prefix}查询配额失败：${e.message}")
         }
-        if (status == 401 || status == 403) {
+        if (status == 401) {
             return CreditInfo(0, known = false, detail = "登录状态已失效，需要重新登录")
         }
         if (status !in 200..299) {
-            return CreditInfo(0, known = false, detail = "$tierLabel · 查询配额失败（HTTP $status）：${body.take(200)}")
+            // 403 在额度端点是权限/订阅校验失败（#3501），不是凭证失效
+            val hint = if (status == 403) "（非登录失效，是上游对客户端/账号的授权校验）" else ""
+            return CreditInfo(
+                0,
+                known = false,
+                detail = "$prefix$tierLabel · 查询配额失败（HTTP $status）$hint：${body.take(300)}",
+            )
         }
         val buckets = parseQuotaBuckets(body)
         if (buckets.isEmpty()) {
             return CreditInfo(0, known = false, detail = "$tierLabel · 上游没有返回模型组配额：${body.take(200)}")
         }
-        val tightest = buckets.minBy { it.remainingPct }
+        // 账号级额度只算共享池；模型专属池（Gemini 4 Argon 等）耗尽不代表账号不能用
+        val accountLevel = buckets.filter { !it.modelOnly }
+        val tightest = (accountLevel.ifEmpty { buckets }).minBy { it.remainingPct }
         val pct = tightest.remainingPct.roundToLong()
         val windows = buckets.joinToString(" · ") { bucket ->
             "${bucket.groupName} ${bucket.windowName} ${bucket.remainingPct.roundToLong()}%"
         }
+        // 模型专属池单独报一句：它是新加的额度限制，用户需要知道是哪块先耗尽
+        val modelOnly = buckets.filter { it.modelOnly }
+            .joinToString("；") { bucket ->
+                "${bucket.groupName} ${bucket.windowName} 剩 ${bucket.remainingPct.roundToLong()}%（${bucket.scopeLabel}）"
+            }
         return CreditInfo(
             pct,
             known = true,
-            detail = "$tierLabel · 组配额剩余 $pct%（最紧：${tightest.groupName} ${tightest.windowName}）；全部窗口：$windows",
+            detail = buildString {
+                append("$tierLabel · 组配额剩余 $pct%（最紧：${tightest.groupName} ${tightest.windowName}）")
+                if (modelOnly.isNotEmpty()) append("；独立配额：$modelOnly")
+                append("；全部窗口：$windows")
+            },
         )
     }
 
@@ -721,6 +783,7 @@ class AntigravityProvider(
                 used = bucket.usedPct.roundToLong(),
                 remain = bucket.remainingPct.roundToLong(),
                 expireAt = bucket.resetAtSeconds,
+                scope = bucket.scopeLabel,
             )
         }
 
@@ -788,11 +851,21 @@ class AntigravityProvider(
         val remainingPct: Double,
         val usedPct: Double,
         val resetAtSeconds: Long,
+        /** 模型专属配额（如 Gemini 4 Argon 独立周池），耗尽只影响对应模型。 */
+        val modelOnly: Boolean = false,
+        /** 模型专属配额的适用范围文案（仅 [modelOnly] 时非空）。 */
+        val scopeLabel: String = "",
     )
 
     /**
      * 解析 `retrieveUserQuotaSummary`：`groups[]` 每组（如 Gemini Models）带若干窗口
      * bucket（周/5 小时），`remainingFraction` 0-1（1 = 未用），`resetTime` ISO 时间。
+     *
+     * 两个易踩的上游行为：
+     * - 周配额耗尽时 Google 会把对应 5h 桶标 `disabled: true` 且 `remainingFraction: 1`，
+     *   照原样展示会多出一条「0% 使用」的假进度条，故直接跳过；
+     * - Gemini 4 Argon 等新模型有**自己的**额外配额池（只有周窗口），它不是账号总额度，
+     *   耗尽时不能把账号判成没额度，故单独标 [QuotaBucket.modelOnly]。
      */
     private fun parseQuotaBuckets(body: String): List<QuotaBucket> {
         val obj = runCatching { JsonParser.parseString(body).asJsonObject }.getOrNull() ?: return emptyList()
@@ -801,26 +874,41 @@ class AntigravityProvider(
         for (groupElement in groups.asJsonArray) {
             val group = groupElement.takeIf { it.isJsonObject }?.asJsonObject ?: continue
             val groupName = group.get("displayName")?.asString?.takeIf { it.isNotEmpty() } ?: "Models"
+            val groupIsModelOnly = modelScopeOf(groupName) != null
             val buckets = group.get("buckets")?.takeIf { it.isJsonArray }?.asJsonArray ?: continue
             for (bucketElement in buckets.asJsonArray) {
                 val bucket = bucketElement.takeIf { it.isJsonObject }?.asJsonObject ?: continue
+                if (bucket.get("disabled")?.takeIf { it.isJsonPrimitive }?.asBoolean == true) continue
                 val fraction = runCatching { bucket.get("remainingFraction")?.asString?.trim()?.toDouble() }
                     .getOrNull() ?: continue
+                val bucketId = bucket.get("bucketId")?.asString.orEmpty()
                 val windowName = bucket.get("displayName")?.asString?.takeIf { it.isNotEmpty() }
-                    ?: bucket.get("bucketId")?.asString?.takeIf { it.isNotEmpty() }
+                    ?: bucketId.takeIf { it.isNotEmpty() }
                     ?: "Limit"
                 val bounded = fraction.coerceIn(0.0, 1.0)
+                // 组名没写明模型时，再看 bucketId（如 gemini-argon-wtu-weekly / gemini-4-argon）
+                val scope = modelScopeOf(groupName) ?: modelScopeOf(bucketId)
                 result += QuotaBucket(
-                    groupName = groupName,
+                    // 模型专属池用统一展示名，避免同一模型因 bucketId 拼写差异被拆成两行
+                    groupName = if (scope != null) "Gemini 4 Argon" else groupName,
                     windowName = windowName,
                     remainingPct = bounded * 100.0,
                     usedPct = (1.0 - bounded) * 100.0,
                     resetAtSeconds = parseIsoSeconds(bucket.get("resetTime")?.asString),
+                    modelOnly = scope != null,
+                    scopeLabel = scope?.let { "仅 $it" }.orEmpty(),
                 )
             }
         }
         return result
     }
+
+    /** 识别「模型专属配额池」并返回其模型名；共享池（Gemini Models / Claude and GPT models）返回 null。
+     *
+     * 只认明确带模型名的池子：Argon 是目前唯一有独立配额的模型，且只有周窗口。
+     */
+    private fun modelScopeOf(text: String): String? =
+        if (text.contains("argon", ignoreCase = true)) "gemini-4-argon" else null
 
     private fun parseIsoSeconds(value: String?): Long {
         if (value.isNullOrBlank()) return 0L
@@ -872,6 +960,15 @@ class AntigravityProvider(
          * 会回 429 RESOURCE_EXHAUSTED（与额度无关），只留作 loadCodeAssist 等账号类接口。
          */
         const val QUOTA_BASE = "https://daily-cloudcode-pa.googleapis.com"
+
+        /**
+         * 配额查询的备用域名：sandbox 与 prod。daily 返回 403/429/5xx 时依次回退
+         * （Antigravity-Manager 的 QUOTA_SUMMARY_ENDPOINTS 同样按 daily → sandbox → prod）。
+         */
+        val QUOTA_FALLBACK_BASES = listOf(
+            "https://daily-cloudcode-pa.sandbox.googleapis.com",
+            "https://cloudcode-pa.googleapis.com",
+        )
 
         /** 上游保留的内部/实验模型，不对外暴露（清单与 CLIProxyAPI fetch_antigravity_models 一致）。 */
         private val EXCLUDED_MODELS = setOf(

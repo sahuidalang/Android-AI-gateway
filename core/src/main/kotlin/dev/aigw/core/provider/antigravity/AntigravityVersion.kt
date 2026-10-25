@@ -29,15 +29,15 @@ internal object AntigravityVersion {
     private const val TTL_MILLIS = 6L * 60 * 60 * 1000
     private const val TIMEOUT_MS = 10_000
 
-    private val cached = AtomicReference<Pair<String, Long>>(FALLBACK_VERSION to 0L)
+    private val cachedHub = AtomicReference<Pair<String, Long>>(FALLBACK_VERSION to 0L)
 
     /** 当前生效的版本号（缓存过期才回源）。 */
     fun current(nowMillis: Long = System.currentTimeMillis()): String {
-        val (version, fetchedAt) = cached.get()
+        val (version, fetchedAt) = cachedHub.get()
         if (nowMillis - fetchedAt < TTL_MILLIS) return version
-        val fetched = fetchLatest()
+        val fetched = fetchLatest(MANIFEST_URL)
         val next = fetched ?: FALLBACK_VERSION
-        cached.set(next to nowMillis)
+        cachedHub.set(next to nowMillis)
         return next
     }
 
@@ -54,8 +54,8 @@ internal object AntigravityVersion {
             ?.trim('"', '\'')
             ?.takeIf { it.isNotEmpty() }
 
-    private fun fetchLatest(): String? = try {
-        val conn = (URL(MANIFEST_URL).openConnection() as HttpURLConnection).apply {
+    private fun fetchLatest(url: String = MANIFEST_URL): String? = try {
+        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
             connectTimeout = TIMEOUT_MS
             readTimeout = TIMEOUT_MS

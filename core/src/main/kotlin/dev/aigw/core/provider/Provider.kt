@@ -61,6 +61,11 @@ data class QuotaPack(
     val remain: Long = 0,
     /** 过期时间（秒，0 表示不过期/未知）。 */
     val expireAt: Long = 0,
+    /**
+     * 仅限某些模型使用的独立配额（如 Gemini 4 Argon 的周额度）；空串表示全账号共享。
+     * 单独列出是为了不让用户把「某个模型用完」误认为「整个账号已耗尽」。
+     */
+    val scope: String = "",
 )
 
 /**
@@ -140,6 +145,15 @@ interface Provider {
     /** provider 专属动作（签到、兑换码等）。默认不支持。 */
     fun performAction(account: ProviderAccount, action: String, payload: JsonObject): ProviderActionResult =
         ProviderActionResult.unsupported(action)
+
+    /**
+     * 这个账号是否适用该动作。默认适用。
+     *
+     * 用于批量动作选目标：区域型供应商的**国际版本来就没有签到/成长中心**，
+     * 应该在选目标时就把它排掉，而不是批量跑完了才逐个报「国际版没有⋯」——
+     * 那种报错既无用又刷屏。
+     */
+    fun supportsAction(account: ProviderAccount, action: String): Boolean = true
 
     /** 粘贴 JSON 凭证导入；不支持则返回 null。 */
     fun importCredentials(raw: String): ProviderAccount? = null

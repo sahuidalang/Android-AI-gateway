@@ -211,9 +211,9 @@ object CodeBuddyUi : ProviderUi {
     /**
      * 任务中心明细：拉取该账号的成长任务清单，逐条展示完成度（已完成 / 可领取 / 进行中 / 未解锁）。
      *
-     * 对照参考实现（WorkBuddy 反代）：`/v2/activity/growth/tasks` 返回 `tasks[]`，
-     * 每条含 title / current / target / accept_status / locked / claimed；
-     * 进度达标又未领取的可点「领取」调 ACTION_TASKS。
+     * 对照参考实现（WorkBuddy 反代）：`GET /v2/activity/growth/tasks` 的 `data.tasks[]`，
+     * 每条含 title / progress.current / progress.target / accept_status / reward_credit。
+     * 顶部「成长中心」按钮跑一键批量（接单 + 领奖），单条任务上的「领取」只领该条。
      */
     @Composable
     private fun TaskListSection(status: AccountStatus, actions: ProviderUiActions) {
@@ -250,7 +250,12 @@ object CodeBuddyUi : ProviderUi {
                 )
             view.tasks.isEmpty() ->
                 Text(
-                    text = if (view.inPeriod) "该账号没有返回任何任务" else "成长活动未开启，暂无可查看的任务",
+                    // 只有上游明确说了不在期才这么写；没说就照实说没有任务
+                    text = if (view.inPeriod == false) {
+                        "成长活动未开启，暂无可查看的任务"
+                    } else {
+                        "该账号没有返回任何任务"
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -303,8 +308,14 @@ object CodeBuddyUi : ProviderUi {
                 )
             }
             if (task.claimable) {
+                // 只领这一个任务：payload 带上 task_code，供应商只对这条发领奖请求
                 ChoiceChip("领取", false) {
-                    actions.onAction(id, uid, ACTION_TASKS, JsonObject())
+                    actions.onAction(
+                        id,
+                        uid,
+                        ACTION_TASKS,
+                        JsonObject().apply { addProperty("task_code", task.code) },
+                    )
                 }
             }
         }
