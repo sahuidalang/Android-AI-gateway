@@ -3,6 +3,7 @@ package dev.aigw.core.provider.loomy
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import dev.aigw.core.provider.AggregatedChatCall
+import dev.aigw.core.provider.ACTION_TASKS
 import dev.aigw.core.provider.AuthKind
 import dev.aigw.core.provider.ChatCall
 import dev.aigw.core.provider.CreditInfo
@@ -17,6 +18,8 @@ import dev.aigw.core.provider.ProviderActionResult
 import dev.aigw.core.provider.ProviderCapability
 import dev.aigw.core.provider.ProviderModel
 import dev.aigw.core.provider.ProviderModelCatalogView
+import dev.aigw.core.provider.ProviderTask
+import dev.aigw.core.provider.ProviderTaskListView
 import dev.aigw.core.provider.QuotaPack
 import dev.aigw.core.provider.requestedModelOf
 import dev.aigw.core.provider.SmsLoginSupport
@@ -35,6 +38,7 @@ class LoomyProvider(
     private val defaultModel: () -> String,
     private val nowMillis: () -> Long = System::currentTimeMillis,
     private val pointsClient: LoomyPointsClient = LoomyPointsClient(),
+    private val taskClient: LoomyTaskClient = LoomyTaskClient(),
     private val hooks: ProviderHooks = ProviderHooks(),
 ) : Provider, SmsLoginSupport {
 
@@ -46,7 +50,6 @@ class LoomyProvider(
 
     private val authClient = LoomyAuthClient(nowMillis = nowMillis)
     private val chatClient = LoomyChatClient()
-    private val taskClient = LoomyTaskClient()
     private val catalog = LoomyModelCatalog(nowMillis = nowMillis)
 
     // ------------------------------------------------------------------ 模型
@@ -206,6 +209,32 @@ class LoomyProvider(
         }
     }
 
+    /**
+     * 新手任务明细（只读，不发任何写操作）。
+     *
+     * Loomy 的任务只有「完成 / 未完成」两态，没有进度与目标，这里映射成 target=1、current=0|1：
+     * 于是 UI 的「已完成」判定（进度达标或已领取）与真实状态一致，也顺带把每条任务的积分当奖励展示。
+     */
+    override fun taskList(account: ProviderAccount): ProviderTaskListView? {
+        val loomy = parseOrNull(account) ?: return null
+        return try {
+            val snapshot = taskClient.tasks(loomy.session)
+            ProviderTaskListView(
+                tasks = snapshot.tasks.map { task ->
+                    ProviderTask(
+                        code = task.key,
+                        title = task.title,
+                        current = if (task.completed) 1L else 0L,
+                        target = 1L,
+                        rewardCredit = task.points.toLong(),
+                    )
+                },
+            )
+        } catch (e: Exception) {
+            ProviderTaskListView(emptyList(), error = e.message ?: "拉取任务列表失败")
+        }
+    }
+
     override fun performAction(
         account: ProviderAccount,
         action: String,
@@ -239,14 +268,31 @@ class LoomyProvider(
                     }
                 }
 
-                ACTION_COMPLETE_ALL_TASKS -> {
+                // 认通用动作名 ACTION_TASKS：UI 的「一键完成新手任务」与批量任务传的都是它。
+                // 从前只认私有的 complete_all_tasks，于是两者都落到 unsupported，
+                // 用户看到「该供应商不支持「tasks」」。
+                ACTION_TASKS -> {
                     val pending = taskClient.tasks(loomy.session).tasks.filter { !it.completed }
                     if (pending.isEmpty()) return ProviderActionResult.success("所有任务都已完成")
-                    val lines = pending.map { task ->
-                        val result = taskClient.complete(loomy.session, task.key)
-                        "${task.title}：${if (result.alreadyCompleted) "此前已完成" else "已完成"}"
+                    // 逐条提交：任务本身对应真实动作（首次对话、生成 PPT 等），服务端会校验，
+                    // 单条被拒不该中断整批、更不该把已经完成的那几条一起丢掉。
+                    val done = ArrayList<String>(pending.size)
+                    val failed = ArrayList<String>()
+                    for (task in pending) {
+                        runCatching { taskClient.complete(loomy.session, task.key) }
+                            .onSuccess { result ->
+                                done.add("${task.title}（${if (result.alreadyCompleted) "此前已完成" else "已完成"}）")
+                            }
+                            .onFailure { e -> failed.add("${task.title}（${e.message ?: "失败"}）") }
                     }
-                    ProviderActionResult.success(lines.joinToString("；"))
+                    val message = buildString {
+                        if (done.isNotEmpty()) append(done.joinToString("；"))
+                        if (failed.isNotEmpty()) {
+                            if (isNotEmpty()) append("；")
+                            append("未能完成：").append(failed.joinToString("；"))
+                        }
+                    }
+                    ProviderActionResult(failed.isEmpty(), message)
                 }
 
                 else -> ProviderActionResult.unsupported(action)
@@ -311,7 +357,6 @@ class LoomyProvider(
         const val ACTION_REDEEM_INVITE = "redeem_invite"
         const val ACTION_REDEEM_CODE = "redeem_code"
         const val ACTION_COMPLETE_TASK = "complete_task"
-        const val ACTION_COMPLETE_ALL_TASKS = "complete_all_tasks"
 
         /** 中国大陆手机号：11 位、1 开头。 */
         private val CN_PHONE = Regex("1[3-9]\\d{9}")

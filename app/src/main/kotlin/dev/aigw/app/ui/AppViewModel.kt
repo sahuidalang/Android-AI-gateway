@@ -292,14 +292,14 @@ data class AppUiState(
     val security: dev.aigw.core.security.SecuritySettings = dev.aigw.core.security.SecuritySettings(),
     /** 可选的悬浮窗保活是否开启（需「显示在其他应用上层」权限）。 */
     val overlayKeepAlive: Boolean = false,
+    /** 实时状态通知（仅网关有请求在途时显示）是否开启，默认开。 */
+    val liveNotification: Boolean = true,
     /** 模型开放名单：只对外暴露勾选的模型。 */
     val modelExposure: dev.aigw.core.gateway.ModelExposureSettings = dev.aigw.core.gateway.ModelExposureSettings(),
     /** 故障转移与并发配置。 */
     val failover: dev.aigw.core.failover.ModelFailoverSettings = dev.aigw.core.failover.ModelFailoverSettings(),
     /** 出网取证记录列表。 */
     val evidences: List<dev.aigw.core.security.OutboundEvidence> = emptyList(),
-    /** 当前生效的脱敏规则词汇数。 */
-    val sanitizerRulesCount: Int = 0,
     val busy: String = "",
     val notice: String = "",
     /** 批量动作进行中的进度；非空时 UI 显示「已完成 X/N（当前：某账号）」。 */
@@ -314,6 +314,8 @@ data class AppUiState(
     val updateDownload: UpdateDownload? = null,
     /** 是否自动检查更新（启动时每天最多一次）。 */
     val autoCheckUpdate: Boolean = true,
+    /** 当前网关在途请求列表（轻量快照）。 */
+    val activeRequests: List<dev.aigw.core.gateway.ActiveRequest> = emptyList(),
 ) {
     /** 某个供应商的账号。 */
     fun accountsOf(providerId: String): List<AccountStatus> = accounts.filter { it.providerId == providerId }
@@ -340,10 +342,10 @@ private class Snapshot(
     val keepAlive: KeepAliveStatus,
     val security: dev.aigw.core.security.SecuritySettings,
     val evidences: List<dev.aigw.core.security.OutboundEvidence>,
-    val sanitizerRulesCount: Int,
     val modelExposure: dev.aigw.core.gateway.ModelExposureSettings,
     val failover: dev.aigw.core.failover.ModelFailoverSettings,
     val overlayKeepAlive: Boolean,
+    val liveNotification: Boolean,
 )
 
 class AppViewModel(
@@ -393,7 +395,22 @@ class AppViewModel(
     @Volatile
     private var modelsFetchedAt = 0L
 
+    private var lastActiveSignature = ""
+    private val activeRequestsListener: (List<dev.aigw.core.gateway.ActiveRequest>) -> Unit = { list ->
+        val sig = list.joinToString(";") { "${it.id}:${it.providerId}:${it.phase}" }
+        if (sig != lastActiveSignature) {
+            lastActiveSignature = sig
+            viewModelScope.launch(Dispatchers.Main.immediate) {
+                _state.value = _state.value.copy(activeRequests = list)
+            }
+        }
+    }
+
     init {
+        engine.activeRequests.addListener(activeRequestsListener)
+        val initialActive = engine.activeRequests.snapshot()
+        lastActiveSignature = initialActive.joinToString(";") { "${it.id}:${it.providerId}:${it.phase}" }
+        _state.value = _state.value.copy(activeRequests = initialActive)
         // 登录在浏览器里完成、由网关的回调监听落池，这里接住通知刷新界面。
         // 只有账号集合真的变了才重拉模型：刷新凭证（refreshAccount 回存）也会触发本回调，
         // 那类更新不影响模型列表，重复拉取只是白白多打一轮上游。
@@ -407,6 +424,12 @@ class AppViewModel(
                 refresh()
             }
         }
+        // 历史遗留的账号标识自愈（如小浣熊早期把 JWT 的 iss 当 uid，导致多账号在池里共用一个 key）：
+        // 后台跑一次，真搬了 key 再刷界面；没搬动就不打扰
+        viewModelScope.launch {
+            val moved = withContext(Dispatchers.IO) { engine.migrateAccounts() }
+            if (moved > 0) refresh()
+        }
         // 调用记录与统计改在引擎后台预载（冷启动不阻塞主线程），就绪后补一次刷新
         engine.setStartupDataReadyListener { refresh() }
         refresh()
@@ -418,6 +441,7 @@ class AppViewModel(
         accounts.joinToString("|") { "${it.providerId}/${it.uid}/${it.disabled}/${it.enabled}" }
 
     override fun onCleared() {
+        engine.activeRequests.removeListener(activeRequestsListener)
         engine.onAccountsChanged = null
         engine.setStartupDataReadyListener(null)
     }
@@ -446,10 +470,10 @@ class AppViewModel(
                     keepAlive = KeepAlive.status(app),
                     security = engine.securitySettings(),
                     evidences = engine.sanitizer.evidenceList(),
-                    sanitizerRulesCount = engine.sanitizer.currentRulesCount(),
                     modelExposure = engine.modelExposureSettings(),
                     failover = engine.failoverSettings(),
                     overlayKeepAlive = dev.aigw.app.data.KeepAlivePrefs.overlayEnabled(engine.store()),
+                    liveNotification = dev.aigw.app.data.KeepAlivePrefs.liveNotificationEnabled(engine.store()),
                 )
             }
             _state.value = _state.value.copy(
@@ -471,10 +495,10 @@ class AppViewModel(
                 keepAlive = snapshot.keepAlive,
                 security = snapshot.security,
                 evidences = snapshot.evidences,
-                sanitizerRulesCount = snapshot.sanitizerRulesCount,
                 modelExposure = snapshot.modelExposure,
                 failover = snapshot.failover,
                 overlayKeepAlive = snapshot.overlayKeepAlive,
+                liveNotification = snapshot.liveNotification,
             )
         }
     }
@@ -627,8 +651,6 @@ class AppViewModel(
 
     // ------------------------------------------------------------------ 模型开放名单
 
-    fun modelExposure(): ModelExposureSettings = engine.modelExposureSettings()
-
     fun updateModelExposure(updated: ModelExposureSettings) {
         viewModelScope.launch {
             withContext(Dispatchers.IO) { engine.updateModelExposure(updated) }
@@ -763,6 +785,23 @@ class AppViewModel(
         if (!dev.aigw.app.data.KeepAlivePrefs.overlayEnabled(engine.store())) return
         if (dev.aigw.app.service.FloatingKeepAlive.isShowing()) return
         dev.aigw.app.service.FloatingKeepAlive.show(app, "网关 ${engine.settings().port}")
+    }
+
+    /**
+     * 开关「实时状态通知」（Android 16 Live Updates）。
+     *
+     * 发布本身由前台服务按在途请求驱动，这里只负责落盘 + 把新开关值同步给通知器：
+     * 关闭时立即撤销正在显示的那条，不必等服务重启。
+     */
+    fun setLiveNotification(enabled: Boolean) {
+        _state.value = _state.value.copy(liveNotification = enabled)
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                dev.aigw.app.data.KeepAlivePrefs.setLiveNotificationEnabled(engine.store(), enabled)
+            }
+            dev.aigw.app.service.LiveStatusNotifier.setEnabled(app, enabled)
+            notice(if (enabled) "实时状态通知已开启" else "实时状态通知已关闭")
+        }
     }
 
     /** 重新加载反审核脱敏处理链。 */
@@ -1335,8 +1374,6 @@ class AppViewModel(
 
     // ------------------------------------------------------------------ 代理
 
-    fun proxySettings(): ProxySettings = engine.proxySettings()
-
     fun updateProxySettings(settings: ProxySettings) {
         _state.value = _state.value.copy(proxy = settings)
         viewModelScope.launch { withContext(Dispatchers.IO) { engine.updateProxySettings(settings) } }
@@ -1575,7 +1612,7 @@ class AppViewModel(
             if (!manual) updateStore.setLastCheckEpochDay(currentEpochDay())
             outcome.fold(
                 onSuccess = { info ->
-                    if (isNewer(info.version, installedVersionName())) {
+                    if (dev.aigw.core.update.isNewerVersion(info.version, installedVersionName())) {
                         _state.value = _state.value.copy(updateInfo = info)
                     } else if (manual) {
                         _state.value = _state.value.copy(notice = "已是最新版本（${installedVersionName()}）")
@@ -1601,18 +1638,6 @@ class AppViewModel(
             apkUrl = release.apkUrl,
             apkSize = release.apkSize,
         )
-    }
-
-    /** 逐段比较版本号，远端更大返回 true。 */
-    private fun isNewer(remote: String, local: String): Boolean {
-        val r = remote.split('.', '-').mapNotNull { it.toIntOrNull() }
-        val l = local.split('.', '-').mapNotNull { it.toIntOrNull() }
-        for (i in 0 until maxOf(r.size, l.size)) {
-            val a = r.getOrElse(i) { 0 }
-            val b = l.getOrElse(i) { 0 }
-            if (a != b) return a > b
-        }
-        return false
     }
 
     /** 当前安装的版本名。 */

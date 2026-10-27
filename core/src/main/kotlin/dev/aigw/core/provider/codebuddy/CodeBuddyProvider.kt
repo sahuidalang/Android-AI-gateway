@@ -22,6 +22,8 @@ import dev.aigw.core.provider.ProviderCapability
 import dev.aigw.core.provider.ProviderModel
 import dev.aigw.core.provider.ProviderModelCatalogView
 import dev.aigw.core.provider.ProviderTask
+import dev.aigw.core.provider.isStreamingBody
+import dev.aigw.core.provider.requestedModelOf
 import dev.aigw.core.provider.ProviderTaskListView
 import dev.aigw.core.provider.QuotaPack
 import dev.aigw.core.provider.StreamFailureChatCall
@@ -106,8 +108,8 @@ class CodeBuddyProvider(
 
     override fun openChat(account: ProviderAccount, openAiBody: String): ChatCall {
         val credential = parse(account) ?: return FailedChatCall(401, "凭证无法解析")
-        val streaming = isStreaming(openAiBody)
-        val model = resolveModel(requestedModel(openAiBody))
+        val streaming = isStreamingBody(openAiBody)
+        val model = resolveModel(requestedModelOf(openAiBody))
         val request = prepareCodeBuddyRequest(openAiBody)
         val prepared = request.body
         // 工具名被改写过时，响应里的调用名要还原（空表 = 直接透传）
@@ -291,14 +293,14 @@ class CodeBuddyProvider(
         val headers = billingHeaders(credential)
         val parts = ArrayList<String>()
 
-        claimGiftAndCompensation(credential, base, headers, parts)
-        adoptBuddy(credential, base, headers, parts)
-        redeemStreak(credential, base, headers, parts)
-        drawLottery(credential, base, headers, parts)
+        claimGiftAndCompensation(credential, headers, parts)
+        adoptBuddy(credential, headers, parts)
+        redeemStreak(credential, headers, parts)
+        drawLottery(credential, headers, parts)
         claimTravel(credential, base, headers, parts)
         claimTasks(credential, base, headers, parts)
         openBlindBox(credential, base, headers, parts)
-        claimSchoolSeason(credential, base, headers, parts)
+        claimSchoolSeason(credential, headers, parts)
 
         return ProviderActionResult.success(
             if (parts.isEmpty()) "成长中心没有可领取的内容" else parts.joinToString("；"),
@@ -308,7 +310,6 @@ class CodeBuddyProvider(
     /** 新手礼包与补偿：两个独立的一次性领取，各自容错。 */
     private fun claimGiftAndCompensation(
         credential: Credential,
-        base: String,
         headers: Map<String, String>,
         parts: MutableList<String>,
     ) {
@@ -334,7 +335,6 @@ class CodeBuddyProvider(
      */
     private fun adoptBuddy(
         credential: Credential,
-        base: String,
         headers: Map<String, String>,
         parts: MutableList<String>,
     ) {
@@ -366,7 +366,6 @@ class CodeBuddyProvider(
      */
     private fun redeemStreak(
         credential: Credential,
-        base: String,
         headers: Map<String, String>,
         parts: MutableList<String>,
     ) {
@@ -390,7 +389,6 @@ class CodeBuddyProvider(
     /** 抽奖：先查次数，有剩余就抽（每次全新 client_token）。 */
     private fun drawLottery(
         credential: Credential,
-        base: String,
         headers: Map<String, String>,
         parts: MutableList<String>,
     ) {
@@ -419,7 +417,6 @@ class CodeBuddyProvider(
     /** 开学季：活动在期时领任务奖、再用获得的机会抽转盘。 */
     private fun claimSchoolSeason(
         credential: Credential,
-        base: String,
         headers: Map<String, String>,
         parts: MutableList<String>,
     ) {
@@ -511,9 +508,6 @@ class CodeBuddyProvider(
     }
 
     /**
-     * 任务：未领取的先接单（进度从接单那刻才开始计），已接单且达标的领奖。
-     */
-    /**
      * 取 CodeBuddy 响应里的 `data` 外层。
      *
      * 该供应商大部分接口把业务字段包在 `{code,msg,data}` 里，个别接口直接给顶层对象，
@@ -522,6 +516,9 @@ class CodeBuddyProvider(
      */
     private fun dataOrRoot(obj: JsonObject): JsonObject = obj.objOrNull("data") ?: obj
 
+    /**
+     * 任务：未领取的先接单（进度从接单那刻才开始计），已接单且达标的领奖。
+     */
     private fun claimTasks(
         credential: Credential,
         base: String,
@@ -1227,8 +1224,6 @@ class CodeBuddyProvider(
         )
     }
 
-    /** 从 access_token（JWT）的 payload 里取某个声明；取不到返回空串。 */
-
     private fun toProviderAccount(credential: Credential): ProviderAccount {
         val secret = JsonObject().apply {
             addProperty("accessToken", credential.accessToken)
@@ -1260,21 +1255,15 @@ class CodeBuddyProvider(
         return ""
     }
 
+    /** 响应体里是否含配额/限频标记词（标记词均为小写）。 */
     private fun matchesQuota(body: String): Boolean {
+        // 标记词已是小写，只需比一次（lower 就是 body 的小写，比两次是冗余）
         val lower = body.lowercase()
-        return QUOTA_MARKERS.any { lower.contains(it) || body.contains(it) }
+        return QUOTA_MARKERS.any { lower.contains(it) }
     }
 
     private fun matchesSessionDead(body: String): Boolean =
         SESSION_DEAD_MARKERS.any { body.contains(it) }
-
-    private fun requestedModel(body: String): String =
-        runCatching { JsonParser.parseString(body).asJsonObject.get("model")?.asString.orEmpty() }
-            .getOrDefault("")
-
-    private fun isStreaming(body: String): Boolean =
-        runCatching { JsonParser.parseString(body).asJsonObject.get("stream")?.asBoolean ?: false }
-            .getOrDefault(false)
 
     private data class Credential(
         val accessToken: String,

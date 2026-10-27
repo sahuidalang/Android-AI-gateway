@@ -312,6 +312,22 @@ class RaccoonProvider(
 
     // ------------------------------------------------------------------ 网页登录
 
+    /**
+     * 修历史遗留的 uid：早期版本把 JWT 的 `iss`（签发方，同站点所有用户同一个值）当成了用户 id，
+     * 于是所有小浣熊账号在池里共用一个 key，后登录的覆盖前一个。
+     *
+     * 只在**能确定**旧 uid 就是那个 iss、且能从 JWT 算出真实用户标识时才返回新账号；
+     * 拿不准一律返回 null，交给用户手动处理，不猜。
+     */
+    override fun migrateAccount(account: ProviderAccount): ProviderAccount? {
+        val credential = parse(account) ?: return null
+        val issuer = jwtClaim(credential.accessToken, "iss")
+        if (issuer.isEmpty() || account.uid != issuer) return null
+        val userId = jwtClaim(credential.accessToken, "user_id", "userId", "uid", "sub")
+        if (userId.isEmpty() || userId == issuer) return null
+        return toProviderAccount(credential.copy(userId = userId), existingUid = userId)
+    }
+
     override fun beginWebLogin(callbackUrl: String, region: String): WebLoginTicket {
         // 不要带 login_source=desktop：授权页会走 `office-raccoon://auth/callback` 自定义 scheme 分支
         // （手机上没有 App 能接），反而不回 redirect。不传时授权页才把 `?authorization_code=…` 回推到 callbackUrl。
@@ -340,12 +356,19 @@ class RaccoonProvider(
         var nickname = jwtClaim(accessToken, "name")
         var pro = false
         var orgCode = ""
-        val userId = jwtClaim(accessToken, "iss")
+        var userId = ""
         val userInfo = runCatching { fetchUserInfo(accessToken) }.getOrNull()
         if (userInfo != null) {
             nickname = userInfo.firstString("name", "nickname", "nick_name", "username").ifEmpty { nickname }
             pro = userInfo.boolOrNull("pro") == true
             orgCode = firstOrgCode(userInfo)
+            userId = userInfo.firstString("userId", "user_id", "uid", "sub")
+        }
+        // 不能用 JWT 的 iss 当用户 id：iss 是签发方，同站点所有用户同一个值，拿它做账号池主键
+        // （key = providerId/uid）会让后登录的账号直接覆盖前一个，表现为「登另一个会取代第一个」。
+        // 取法与 CodeBuddy 一致：先 user_info 的用户字段，再退到 JWT 的用户声明。
+        if (userId.isEmpty()) {
+            userId = jwtClaim(accessToken, "user_id", "userId", "uid", "sub")
         }
 
         val credential = Credential(
@@ -399,12 +422,26 @@ class RaccoonProvider(
                 when {
                     granted && points > 0 -> "签到成功，+$points 积分"
                     granted -> message.ifEmpty { "签到成功" }
-                    message.isNotEmpty() -> message
+                    message.isNotEmpty() -> friendlyCheckinResult(message)
                     else -> "本次未发放积分（可能今日已领取）"
                 },
             )
         } catch (e: Exception) {
             ProviderActionResult.failure(e.message ?: "签到失败")
+        }
+    }
+
+    /**
+     * 上游回执多是英文短词，直接透出对中文用户不友好；认得的翻成中文，
+     * **不认识的原样返回**（不猜、不吞掉上游信息）。
+     */
+    private fun friendlyCheckinResult(raw: String): String {
+        val text = raw.trim()
+        return when (text.lowercase()) {
+            "success", "ok", "true", "succeeded", "successful" -> "签到成功"
+            "already checked in", "already_checkin", "already signed", "already_sign" -> "今日已签到"
+            "not checked in", "not_checkin" -> "今日尚未签到"
+            else -> text
         }
     }
 

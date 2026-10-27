@@ -439,13 +439,6 @@ class AntigravityProvider(
         return account
     }
 
-    /** 从回调 URL 里解析 code 并换凭证。 */
-    fun completeFromCallback(callbackUrl: String): ProviderAccount {
-        val code = queryParam(callbackUrl, "code")
-            ?: throw IllegalStateException("回调里没有 code 参数")
-        return exchangeCode(code)
-    }
-
     // ------------------------------------------------------------------ HTTP
 
     private fun exchangeCodeForTokens(code: String): Tokens {
@@ -874,7 +867,6 @@ class AntigravityProvider(
         for (groupElement in groups.asJsonArray) {
             val group = groupElement.takeIf { it.isJsonObject }?.asJsonObject ?: continue
             val groupName = group.get("displayName")?.asString?.takeIf { it.isNotEmpty() } ?: "Models"
-            val groupIsModelOnly = modelScopeOf(groupName) != null
             val buckets = group.get("buckets")?.takeIf { it.isJsonArray }?.asJsonArray ?: continue
             for (bucketElement in buckets.asJsonArray) {
                 val bucket = bucketElement.takeIf { it.isJsonObject }?.asJsonObject ?: continue
@@ -977,12 +969,6 @@ class AntigravityProvider(
         )
 
         private const val MODEL_CACHE_TTL_MILLIS = 10L * 60 * 1000
-
-        /**
-         * 运行时 UA 的兜底版本（版本号本身动态化，见 [AntigravityVersion]）。
-         * 保留常量仅供测试与文档引用，业务代码请用 [AntigravityVersion.userAgent]。
-         */
-        const val USER_AGENT = "antigravity/hub/2.23.0 darwin/arm64"
 
         val SCOPES = listOf(
             "https://www.googleapis.com/auth/cloud-platform",

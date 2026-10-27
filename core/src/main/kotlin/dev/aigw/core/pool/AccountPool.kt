@@ -159,11 +159,6 @@ class AccountPool(
         else byProvider[providerId]?.size ?: 0
     }
 
-    /** 已知 provider 的 id 列表（按首次出现顺序）。 */
-    fun providerIds(): List<String> = lock.read {
-        entries.values.map { it.account.providerId }.distinct()
-    }
-
     // ---------------------------------------------------------------- 状态
 
     fun setEnabled(providerId: String, uid: String, enabled: Boolean, reason: String = "") {
@@ -215,6 +210,29 @@ class AccountPool(
             entries[keyOf(account.providerId, account.uid)]?.account = account
         }
         persistAccount(account)
+    }
+
+    /**
+     * 迁移账号标识：把 [oldUid] 的条目换成 [newAccount]（uid 变了，凭证与状态跟着走）。
+     *
+     * 用在 uid 口径变更后的自愈（如小浣熊曾把 JWT 的 iss 当 uid 导致多账号共用一个 key）。
+     * 先登记新 key 再删旧 key：中途失败也不会把账号弄丢，最坏是两条并存，用户可手动删。
+     *
+     * @return true 表示真的搬了 key。
+     */
+    fun renameAccount(providerId: String, oldUid: String, newAccount: ProviderAccount): Boolean {
+        if (oldUid == newAccount.uid) {
+            upsert(newAccount)
+            return false
+        }
+        val before = status(providerId, oldUid)
+        upsert(newAccount)
+        if (before != null) {
+            if (!before.enabled) setEnabled(providerId, newAccount.uid, false, before.reason)
+            if (before.creditsKnown) updateCredits(providerId, newAccount.uid, before.credits, true, before.detail)
+        }
+        remove(providerId, oldUid)
+        return true
     }
 
     // ---------------------------------------------------------------- 选号
