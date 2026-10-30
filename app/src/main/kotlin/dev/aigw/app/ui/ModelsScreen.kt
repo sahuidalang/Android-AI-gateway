@@ -201,7 +201,9 @@ fun ModelsScreen(state: AppUiState, viewModel: AppViewModel) {
             } else {
                 // 已加载的模型按组展示
                 for ((routePrefix, models) in grouped) {
-                    val title = models.firstOrNull()?.providerName ?: routePrefix
+                    // 分组标题兜底同样剥掉内部前缀，避免出现 custom:xxx 这种实现细节
+                    val title = models.firstOrNull()?.providerName
+                        ?: routePrefix.removePrefix(RoutedModel.CUSTOM_PREFIX)
                     val allExposed = models.isNotEmpty() && models.all { exposure.allows(it.fullId) }
                     // 这一组本轮没拉到上游、用的是上次成功的清单：明确标注，不能让旧清单冒充实时结果
                     val cachedGroup = models.isNotEmpty() && models.all { it.cached }
@@ -289,8 +291,9 @@ fun ModelsScreen(state: AppUiState, viewModel: AppViewModel) {
                             exposed = exposure.allows(model.fullId),
                             onToggleExposed = { viewModel.toggleModelExposed(model.fullId, it) },
                             onCopy = {
+                                // 复制的是真实可用的完整 id，提示里只展示干净的名字
                                 clipboard.setText(AnnotatedString(model.fullId))
-                                Toast.makeText(context, "已复制模型名称：${model.fullId}", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, "已复制模型名称：${model.displayId}", Toast.LENGTH_SHORT).show()
                             },
                             onTest = { viewModel.testModel(model) },
                             onShowFailure = { failureDetail = it },
@@ -301,7 +304,7 @@ fun ModelsScreen(state: AppUiState, viewModel: AppViewModel) {
                 // 若已有部分模型展示，而剩余供应商仍在加载中，在下方继续展示该供应商的骨架占位
                 if (state.modelsLoading && pendingProviders.isNotEmpty()) {
                     items(pendingProviders.toList(), key = { "skeleton-$it" }) { id ->
-                        val name = state.providerOf(id)?.displayName ?: id
+                        val name = state.providerOf(id)?.displayName ?: RoutedModel.displayProviderId(id)
                         ModelSkeletonCard(providerName = name)
                     }
                 }
@@ -409,7 +412,8 @@ private fun ModelRow(
                 horizontalArrangement = Arrangement.spacedBy(4.dp),
             ) {
                 Text(
-                    text = model.fullId,
+                    // 展示用 id：自定义供应商的 `custom:` 内部前缀不铺给用户看
+                    text = model.displayId,
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.SemiBold,
                 )

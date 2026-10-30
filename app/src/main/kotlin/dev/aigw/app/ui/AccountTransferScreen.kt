@@ -33,6 +33,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import dev.aigw.core.provider.RoutedModel
 import dev.aigw.core.pool.AccountImportResult
 import dev.aigw.core.provider.ProviderAccount
 import kotlinx.coroutines.Dispatchers
@@ -157,7 +158,7 @@ fun AccountTransferScreen(
             if (!exportAll) {
                 AccountTree(
                     groups = exportGroups,
-                    displayName = { id -> state.providerOf(id)?.displayName ?: id },
+                    displayName = { id -> state.providerOf(id)?.displayName ?: RoutedModel.displayProviderId(id) },
                     selected = exportSelection,
                     onSelectionChange = { exportSelection = it },
                 )
@@ -340,7 +341,7 @@ fun AccountTransferScreen(
                 }
                 AccountTree(
                     groups = grouped,
-                    displayName = { id -> state.providerOf(id)?.displayName ?: id },
+                    displayName = { id -> state.providerOf(id)?.displayName ?: RoutedModel.displayProviderId(id) },
                     selected = importSelection,
                     onSelectionChange = { importSelection = it },
                 )

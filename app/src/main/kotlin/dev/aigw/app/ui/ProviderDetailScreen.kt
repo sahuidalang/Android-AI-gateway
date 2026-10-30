@@ -22,6 +22,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import dev.aigw.core.provider.RoutedModel
 import dev.aigw.app.ui.providers.ProviderUiActions
 import dev.aigw.app.ui.providers.ProviderUiRegistry
 /**
@@ -97,7 +98,7 @@ fun ProviderDetailScreen(
     }
 
     PageScaffold(
-        title = info?.displayName ?: providerId,
+        title = info?.displayName ?: RoutedModel.displayProviderId(providerId),
         subtitle = "${accounts.size} 个账号 · 可用 ${accounts.count { it.usable }}",
         leading = {
             Icon(

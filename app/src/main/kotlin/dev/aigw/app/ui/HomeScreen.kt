@@ -362,7 +362,9 @@ private fun LiveRoutingTopologyCard(state: AppUiState, modifier: Modifier = Modi
                 val accs = groupedAccounts[pid] ?: emptyList()
                 val usable = accs.count { it.usable }
                 val provInfo = state.providers.firstOrNull { it.id.equals(pid, ignoreCase = true) }
-                val dName = provInfo?.displayName?.ifEmpty { pid.uppercase() } ?: pid.uppercase()
+                // 兜底展示名同样剥掉自定义供应商的内部前缀
+                val cleanPid = RoutedModel.displayProviderId(pid).uppercase()
+                val dName = provInfo?.displayName?.ifEmpty { cleanPid } ?: cleanPid
 
                 val weight = if (totalRecentCalls > 0) {
                     ((callCountsByProvider[pid] ?: 0).toFloat() / totalRecentCalls).coerceIn(0.08f, 1f)
@@ -867,7 +869,7 @@ private fun RecentCallRoutingFlow(call: CallRecord?) {
         RoutingFlowRow(
             dotColor = LocalAppColors.current.goldStart,
             label = "路由到",
-            detail = "${call.providerId.uppercase()} · $accountDisplay",
+            detail = "${RoutedModel.displayProviderId(call.providerId).uppercase()} · $accountDisplay",
         )
 
         // 行 3：结果与耗时

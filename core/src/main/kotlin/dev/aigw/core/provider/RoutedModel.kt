@@ -21,4 +21,22 @@ data class RoutedModel(
     val cached: Boolean = false,
 ) {
     val fullId: String get() = "$routePrefix/${model.id}"
+
+    /**
+     * 界面展示用的 id。
+     *
+     * 自定义供应商的 [routePrefix] 带内部标识前缀 `custom:`（如 `custom:mysite`），
+     * 这层前缀只用于网关内部路由与实例登记，属于实现细节；直接摊在模型列表里
+     * 会让人以为模型名本身长这样。展示时剥掉，复制/调用仍用 [fullId]。
+     */
+    val displayId: String get() = "${routePrefix.removePrefix(CUSTOM_PREFIX)}/${model.id}"
+
+    companion object {
+        /** 自定义供应商 id/路由前缀的统一前缀，与 `ProviderUiRegistry.CUSTOM_PREFIX` 保持一致。 */
+        const val CUSTOM_PREFIX = "custom:"
+
+        /** 把 provider id 转成可展示的文本：只剥掉内部的 `custom:` 前缀，其余原样。 */
+        fun displayProviderId(providerId: String): String =
+            providerId.removePrefix(CUSTOM_PREFIX)
+    }
 }

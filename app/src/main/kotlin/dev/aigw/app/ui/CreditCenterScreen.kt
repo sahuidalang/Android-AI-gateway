@@ -16,6 +16,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import dev.aigw.core.provider.RoutedModel
 import dev.aigw.core.provider.ProviderCapability
 
 /**
@@ -92,7 +93,8 @@ fun ProviderCreditsScreen(
     onBack: () -> Unit,
 ) {
     val accounts = state.accountsOf(providerId)
-    val displayName = state.providerOf(providerId)?.displayName ?: providerId
+    val displayName = state.providerOf(providerId)?.displayName
+        ?: RoutedModel.displayProviderId(providerId)
     val hasLedger = state.providerOf(providerId)?.capabilities?.contains(ProviderCapability.POINTS_BILLS) == true
 
     // 进页面拉一次；账号变化时重拉
