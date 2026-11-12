@@ -4,6 +4,7 @@ import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -26,6 +27,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -253,6 +255,13 @@ class CustomUi(override val id: String) : ProviderUi {
                         fontWeight = FontWeight.SemiBold,
                     )
                     Spacer(Modifier.weight(1f))
+                    val allFilteredSelected = filtered.isNotEmpty() && filtered.all { selected[it] == true }
+                    TextButton(
+                        onClick = {
+                            if (allFilteredSelected) filtered.forEach { selected.remove(it) } else filtered.forEach { selected[it] = true }
+                        },
+                        contentPadding = PaddingValues(horizontal = 8.dp),
+                    ) { Text(if (allFilteredSelected) "取消全选" else "全选") }
                     Text(
                         text = "已选 $selectedCount 个",
                         style = MaterialTheme.typography.labelMedium,
